@@ -167,10 +167,10 @@ Determine architecture:
 docker exec cli-proxy-api uname -m
 ```
 
-For Linux AMD64:
+For Linux AMD64 (`--ignore-missing` lets the single downloaded archive verify against the full five-platform `checksums.txt`):
 
 ```bash
-sha256sum -c checksums.txt
+sha256sum -c --ignore-missing checksums.txt
 unzip account-health-pushover_0.1.0_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api

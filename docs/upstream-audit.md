@@ -38,7 +38,8 @@ Primary audited paths:
 - Plugin-provided response buffers are allocated by the plugin and released through its exported free function.
 - Host callback response buffers are released through `host->free_buffer`.
 - Go plugins build with CGO and `-buildmode=c-shared`.
-- CPA derives plugin ID from the shared-library filename, so the installed file must be `account-health-pushover.so`, `.dylib`, or `.dll`.
+- CPA derives the plugin ID from the shared-library basename and accepts both `account-health-pushover.<ext>` and the versioned `account-health-pushover-v<X.Y.Z>.<ext>` (`internal/pluginhost/platform.go`).
+- The Plugin Store installer writes the versioned form to `<plugins-dir>/<goos>/<goarch>/account-health-pushover-v<X.Y.Z>.<ext>` (`internal/pluginstore/install.go` `installTargetPath`/`versionedPluginFileName`); the host searches `<plugins-dir>/<goos>/<goarch>` before the plugins root, so manual unversioned root installs also load.
 
 ## Lifecycle and capabilities
 
@@ -156,4 +157,6 @@ Audited `router-for-me/CLIProxyAPI-Plugins-Store` commit:
 
 `d0fad4e4bba116ae495de74bf70d2256f37c2a47`
 
-Current official registry uses schema version 1. Required plugin fields are `id`, `name`, `description`, `author`, and an exact GitHub repository URL. Releases are discovered from GitHub Releases; tags use `v<version>`, ZIPs use `<id>_<version>_<goos>_<goarch>.zip`, and `checksums.txt` uses standard lowercase SHA-256 `sha256sum` lines. Each ZIP in this repository contains exactly one expected shared library at the archive root.
+Current official registry uses schema version 1. Required plugin fields are `id`, `name`, `description`, `author`, and an exact GitHub repository URL (`https://github.com/{owner}/{repo}`, HTTPS only, exactly two path segments, no query/fragment, no `.git` suffix). Plugin IDs must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; an optional registry `version` must not be `v`-prefixed. `release_contract_test.go` mirrors these validation rules locally.
+
+Releases are discovered from GitHub Releases; tags use `v<version>`, ZIPs use `<id>_<version>_<goos>_<goarch>.zip`, and `checksums.txt` uses standard lowercase SHA-256 `sha256sum` lines. Upstream `SelectReleaseAssets` hard-fails an install when the platform archive or `checksums.txt` is missing from the release. Each ZIP in this repository contains exactly one expected shared library at the archive root; upstream `InstallArchive` extracts it and writes the versioned library into `<plugins-dir>/<goos>/<goarch>/`.

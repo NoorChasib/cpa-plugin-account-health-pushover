@@ -110,7 +110,7 @@ Full deployment instructions: [docs/install-docker-compose.md](docs/install-dock
 2. Restart/reload CPA after changing configuration.
 3. Open Management Center → Plugin Store and refresh.
 4. Install **Account Health Pushover** (`account-health-pushover`).
-5. Verify `account-health-pushover.so` exists under `/CLIProxyAPI/plugins`.
+5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.1.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
 6. Add the two Coolify secret variables and enable the plugin config.
 7. Restart/reload CPA.
 8. Open the plugin status resource, use **Test notification**, then use **Check now**.
@@ -125,20 +125,21 @@ Determine container architecture:
 docker exec cli-proxy-api uname -m
 ```
 
-Download the matching release archive, verify it against `checksums.txt`, then:
+Download the matching release archive plus `checksums.txt`, then verify and install (`--ignore-missing` allows verifying a single downloaded archive against the full five-platform manifest):
 
 ```bash
+sha256sum -c --ignore-missing checksums.txt
 unzip account-health-pushover_0.1.0_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
-docker exec cli-proxy-api ls -lah /CLIProxyAPI/plugins
+docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
 docker logs --tail=200 cli-proxy-api
 ```
 
-Update by verifying and copying the newer `.so` over the old path, then restart CPA. Uninstall with:
+Manual installs may use the unversioned root path shown above; Plugin Store installs land at `/CLIProxyAPI/plugins/<goos>/<goarch>/account-health-pushover-v<X.Y.Z>.so` instead. Update by verifying and copying the newer `.so` over the old path, then restart CPA. Uninstall by removing **both** layouts so a Plugin Store copy cannot remain loaded:
 
 ```bash
-docker exec cli-proxy-api rm -f /CLIProxyAPI/plugins/account-health-pushover.so
+docker exec cli-proxy-api sh -c 'rm -f /CLIProxyAPI/plugins/account-health-pushover.so /CLIProxyAPI/plugins/*/*/account-health-pushover-v*.so'
 docker restart cli-proxy-api
 ```
 
@@ -245,11 +246,15 @@ make checksums
 make verify-release
 ```
 
+`make verify-release` strictly verifies whatever platform archives are present (partial mode). `make verify-release-full` additionally requires the complete five-platform bundle; the release workflow enforces full mode before publishing.
+
 Run the disposable Docker integration test:
 
 ```bash
 make smoke
 ```
+
+Without a working Docker daemon the smoke test prints `SKIP: Docker unavailable` and exits 0. CI sets `CPA_SMOKE_REQUIRE_DOCKER=1`, which turns that skip into a hard failure so the integration test can never be silently skipped in CI.
 
 The smoke build enables a compile-time-only local/mock endpoint seam. Release builds ignore `CPA_PUSHOVER_TEST_ENDPOINT` and always use Pushover's fixed HTTPS endpoint.
 

@@ -28,15 +28,19 @@ The root registry is schema version 1 and contains one plugin entry. CPA continu
 7. Verify the platform library is present:
 
    ```bash
-   docker exec cli-proxy-api ls -lah /CLIProxyAPI/plugins
+   docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
    ```
+
+   A Plugin Store install writes a **versioned** library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.1.0.so` — not an unversioned file at the plugins root.
 
 8. Add the plugin config and Pushover secret environment variables.
 9. Restart/reload CPA.
 10. Open `/v0/resource/plugins/account-health-pushover/status`.
 11. Run **Test notification** and **Check now**.
 
-Current CPA derives plugin ID from the installed library basename. The root entry in every release archive is unversioned:
+Current CPA derives the plugin ID from the installed library basename and accepts both the unversioned form `account-health-pushover.<ext>` and the versioned form `account-health-pushover-v<X.Y.Z>.<ext>`. The Plugin Store installer writes the versioned form to `<plugins-dir>/<goos>/<goarch>/account-health-pushover-v<X.Y.Z>.<ext>`; the host searches that platform directory before the plugins root, so manual root installs also load.
+
+The root entry inside every release archive remains unversioned:
 
 ```text
 account-health-pushover.so
@@ -59,18 +63,25 @@ CPA selects release assets by exact runtime GOOS/GOARCH. An update is unavailabl
 
 1. Download the prior matching archive.
 2. Verify its SHA-256 against that release's `checksums.txt`.
-3. Replace the installed library at the same unversioned path.
-4. Restart CPA and verify status.
+3. Remove the newer installed library so CPA cannot keep preferring it. Plugin Store installs are versioned, so both layouts must be considered:
+
+   ```bash
+   docker exec cli-proxy-api sh -c 'rm -f /CLIProxyAPI/plugins/account-health-pushover.so /CLIProxyAPI/plugins/*/*/account-health-pushover-v*.so'
+   ```
+
+4. Install the prior release through the Plugin Store, or copy the prior library manually to `/CLIProxyAPI/plugins/account-health-pushover.so`.
+5. Restart CPA and verify status.
 
 Persisted state schema version 1 is used by v0.1.0.
 
 ## Uninstall
 
-1. Uninstall in Plugin Store, or remove the library manually:
+1. Uninstall in Plugin Store, or remove the library manually. The removal must cover both the unversioned root layout (manual installs) and the versioned platform-subdirectory layout (Plugin Store installs) — removing only the root path silently no-ops for store installs and leaves the plugin loaded after restart:
 
    ```bash
-   docker exec cli-proxy-api rm -f /CLIProxyAPI/plugins/account-health-pushover.so
+   docker exec cli-proxy-api sh -c 'rm -f /CLIProxyAPI/plugins/account-health-pushover.so /CLIProxyAPI/plugins/*/*/account-health-pushover-v*.so'
    docker restart cli-proxy-api
+   docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
    ```
 
 2. Disable/remove `plugins.configs.account-health-pushover`.

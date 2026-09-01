@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 
 GO ?= go
+GOFMT ?= gofmt
 PLUGIN_ID := account-health-pushover
 MODULE := github.com/NoorChasib/cpa-plugin-account-health-pushover
 VERSION ?= 0.1.0
@@ -19,15 +20,15 @@ endif
 LIB := dist/$(PLUGIN_ID).$(LIB_EXT)
 ARCHIVE := dist/$(PLUGIN_ID)_$(VERSION)_$(GOOS)_$(GOARCH).zip
 
-.PHONY: all fmt fmt-check test test-race vet build c-shared ci clean package-current checksums verify-release smoke
+.PHONY: all fmt fmt-check test test-race vet build c-shared ci clean package-current checksums verify-release verify-release-full smoke
 
 all: ci c-shared
 
 fmt:
-	$(GO)fmt -w .
+	$(GOFMT) -w .
 
 fmt-check:
-	@test -z "$$($(GO)fmt -l .)" || { $(GO)fmt -l .; exit 1; }
+	@test -z "$$($(GOFMT) -l .)" || { $(GOFMT) -l .; exit 1; }
 
 test:
 	$(GO) test ./...
@@ -52,9 +53,19 @@ package-current: c-shared
 	python3 scripts/package-release.py --library $(LIB) --archive $(ARCHIVE) --entry $(PLUGIN_ID).$(LIB_EXT)
 
 checksums:
-	cd dist && sha256sum $(PLUGIN_ID)_*.zip | sort > checksums.txt
+	@cd dist && if command -v sha256sum >/dev/null 2>&1; then \
+		sha256sum $(PLUGIN_ID)_*.zip | sort > checksums.txt; \
+	else \
+		shasum -a 256 $(PLUGIN_ID)_*.zip | sort > checksums.txt; \
+	fi
 
+# Verifies whatever platform archives exist in dist (e.g. the single archive
+# from `make package-current`). The release workflow's verify-bundle/publish
+# jobs run the full five-platform check via verify-release-full semantics.
 verify-release:
+	./scripts/verify-release.sh --partial dist
+
+verify-release-full:
 	./scripts/verify-release.sh dist
 
 smoke:

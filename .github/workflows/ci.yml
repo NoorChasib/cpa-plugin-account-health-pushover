@@ -8,9 +8,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -27,13 +32,16 @@ jobs:
         run: make build
       - name: Build native plugin
         run: make c-shared
-      - name: Validate registry and release contract tests
-        run: go test ./...
       - name: Package current platform
         run: make package-current VERSION=0.1.0
       - name: Generate checksums
         run: make checksums
-      - name: Verify release archive and checksums
+      - name: Verify packaged archive and checksums (partial bundle)
         run: make verify-release
+      # Note: make smoke pulls the unpinned eceasy/cli-proxy-api:latest image.
+      # CPA_SMOKE_REQUIRE_DOCKER=1 forbids the local no-Docker skip path so the
+      # integration test can never be skipped silently in CI.
       - name: Run Docker integration smoke test
+        env:
+          CPA_SMOKE_REQUIRE_DOCKER: "1"
         run: make smoke

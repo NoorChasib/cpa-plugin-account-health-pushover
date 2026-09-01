@@ -24,6 +24,10 @@ make verify-release
 make smoke
 ```
 
+`make verify-release` runs the verifier in partial mode: it strictly validates every archive, sidecar, and `checksums.txt` entry that is present, without requiring all five platforms (only the current platform is built locally). `make verify-release-full` (equivalently `./scripts/verify-release.sh dist` with no flag) additionally requires the complete five-platform bundle with one consistent version; the release workflow runs full mode in its `verify-bundle` and `publish` jobs.
+
+Without a working Docker daemon, `make smoke` prints `SKIP: Docker unavailable` and exits 0. CI sets `CPA_SMOKE_REQUIRE_DOCKER=1` to turn that skip into a hard failure.
+
 The Docker smoke test:
 
 - builds a native Linux plugin;
@@ -40,15 +44,16 @@ Release builds do not set the test seam and always use Pushover HTTPS.
 
 1. Update version references if releasing beyond `0.1.0`. v0.1 release automation accepts stable `vX.Y.Z` tags only; prerelease suffixes are intentionally rejected.
 2. Confirm `git status` is clean and CI passes.
-3. Create and push an annotated tag:
+3. **Mandatory rehearsal:** run the Release workflow manually on the release commit (GitHub → Actions → Release → Run workflow). The optional `version` input (default `0.1.0`, stable `X.Y.Z` only) is used solely to name the rehearsal artifacts. The rehearsal must complete all five platform build legs **and** the `verify-bundle` job, which downloads every artifact and runs the full-mode `verify-release.sh` against the assembled five-platform bundle. Rehearsals never publish: the `publish` job runs only for tag pushes. Do not tag until the rehearsal is green — the four cross-platform legs (including the Windows UCRT64 leg) execute nowhere else before tag time.
+4. Create and push an annotated tag:
 
    ```bash
    git tag -a v0.1.0 -m "Release v0.1.0"
    git push origin v0.1.0
    ```
 
-4. The tag-triggered workflow runs format, vet, race tests, normal build, and a native c-shared matrix.
-5. The workflow publishes:
+5. The tag-triggered workflow runs format, vet, race tests, normal build, the enforced Docker smoke test, and a native c-shared matrix.
+6. The workflow publishes:
 
    ```text
    account-health-pushover_0.1.0_linux_amd64.zip
@@ -59,15 +64,15 @@ Release builds do not set the test seam and always use Pushover HTTPS.
    checksums.txt
    ```
 
-6. Each ZIP is validated to contain exactly one root shared library with the platform extension.
-7. `checksums.txt` is generated from per-build SHA-256 sidecars and verified before `gh release create --verify-tag`.
+7. Each ZIP is validated to contain exactly one root shared library with the platform extension.
+8. `checksums.txt` is generated from per-build SHA-256 sidecars, and the full five-platform bundle is verified (all platforms present, one consistent version, sidecar and `checksums.txt` cross-checks with no missing or orphan entries) in the `verify-bundle` job and again in `publish` before `gh release create --verify-tag`.
 
 ## Manual release verification
 
 Download all release assets into one directory:
 
 ```bash
-sha256sum -c checksums.txt
+sha256sum -c checksums.txt          # macOS: shasum -a 256 -c checksums.txt
 ./scripts/verify-release.sh .
 ```
 
@@ -97,8 +102,8 @@ https://raw.githubusercontent.com/NoorChasib/cpa-plugin-account-health-pushover/
 
 ## Rollback
 
-Use Plugin Store rollback if available, or verify/copy the prior release library over the unversioned installed filename and restart CPA. Do not delete the state file during a normal binary rollback unless that release documents an incompatible schema.
+Use Plugin Store rollback if available. For a manual rollback, remember that Plugin Store installs are **versioned** (`/CLIProxyAPI/plugins/<goos>/<goarch>/account-health-pushover-v<X.Y.Z>.<ext>`) while manual installs use the unversioned plugins-root filename. Remove the newer library from both layouts, then install the verified prior release through the store or copy the prior library to the plugins root, and restart CPA (see docs/custom-plugin-store.md "Manual rollback" for exact commands). Do not delete the state file during a normal binary rollback unless that release documents an incompatible schema.
 
 ## CI caveat to verify
 
-The release workflow uses GitHub-hosted `macos-15-intel` for Darwin AMD64 and `macos-15` for Darwin ARM64. GitHub runner labels evolve; verify those labels remain available before the first tag release. The release cannot be considered valid unless all five required jobs publish their archives.
+The release workflow uses GitHub-hosted `macos-15-intel` for Darwin AMD64 and `macos-15` for Darwin ARM64, and the Windows leg compiles with the MSYS2 UCRT64 gcc installed from the runner's preinstalled MSYS2 (`C:\msys64`). GitHub runner labels and preinstalled software evolve; the mandatory `workflow_dispatch` rehearsal above is what proves all five legs still build before the first tag release. The release cannot be considered valid unless all five required jobs publish their archives — the `verify-bundle` job enforces exactly that.

@@ -5,11 +5,11 @@
 Check:
 
 ```bash
-docker exec cli-proxy-api ls -lah /CLIProxyAPI/plugins
+docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
 docker logs --tail=200 cli-proxy-api
 ```
 
-The library basename must be exactly `account-health-pushover.so` on Linux. Confirm `plugins.enabled: true`, `plugins.dir: "plugins"` for the standard `/CLIProxyAPI` working directory, and `plugins.configs.account-health-pushover.enabled: true`.
+On Linux the installed library must keep the plugin-ID basename in one of the two accepted forms: `account-health-pushover.so` (manual installs at the plugins root) or `account-health-pushover-v<X.Y.Z>.so` (Plugin Store installs under `/CLIProxyAPI/plugins/linux/<goarch>/`). CPA searches `<plugins-dir>/<goos>/<goarch>` first, then the plugins root. Confirm `plugins.enabled: true`, `plugins.dir: "plugins"` for the standard `/CLIProxyAPI` working directory, and `plugins.configs.account-health-pushover.enabled: true`.
 
 A shared library built for the wrong OS/architecture cannot load. Compare the release archive with:
 
