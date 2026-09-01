@@ -9,10 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/config"
+	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/health"
+	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/monitor"
+	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/notifier"
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/protocol"
 )
 
@@ -76,7 +80,7 @@ func TestRegistrationUsesCurrentABIContract(t *testing.T) {
 	for _, field := range registration.Metadata.ConfigFields {
 		fieldNames[field.Name] = true
 	}
-	for _, required := range []string{"providers", "scan-interval", "startup-grace", "transient-confirm-after", "notify-recovery", "reminder-interval", "pushover-app-token-env", "pushover-user-key-env", "management-url"} {
+	for _, required := range []string{"providers", "scan-interval", "startup-grace", "transient-confirm-after", "unauthorized-confirm-after", "usage-recheck-delay", "notify-recovery", "reminder-interval", "pushover-app-token-env", "pushover-user-key-env", "management-url"} {
 		if !fieldNames[required] {
 			t.Fatalf("missing ConfigField %q", required)
 		}
@@ -102,48 +106,67 @@ func TestManagementRegistrationPaths(t *testing.T) {
 	}
 }
 
-func TestUsage401SchedulesRecheckAnd429DoesNot(t *testing.T) {
+func TestUsageEvidenceIsDelayedByStartupGraceAndBodyIsDiscarded(t *testing.T) {
+	bodySecret := "RAW-USAGE-BODY-SECRET-SENTINEL"
 	host := &pluginFakeHost{entry: protocol.HostAuthFileEntry{
 		AuthIndex: "one", Provider: "claude", Type: "claude", AccountType: "oauth", Email: "a@example.com", Status: "active",
 	}}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"status":1}`) }))
+	var notificationCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		notificationCount.Add(1)
+		_, _ = io.WriteString(w, `{"status":1}`)
+	}))
 	defer server.Close()
 	p := configurePlugin(t, host, server.URL)
 
-	start := time.Now()
-	usage401, _ := json.Marshal(protocol.UsageRecord{Failed: true, AuthIndex: "one", Failure: protocol.UsageFailure{StatusCode: 401, Body: "must be ignored"}})
+	usage401 := []byte(`{"Failed":true,"AuthIndex":"one","Failure":{"StatusCode":401,"Body":"` + bodySecret + `"}}`)
 	if _, err := p.Handle(protocol.MethodUsageHandle, usage401); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(start) > 20*time.Millisecond {
-		t.Fatal("usage callback blocked")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		host.mu.Lock()
-		calls := host.listCalls
-		host.mu.Unlock()
-		if calls == 1 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
 	host.mu.Lock()
-	before429 := host.listCalls
+	callsBeforeManualCheck := host.listCalls
 	host.mu.Unlock()
-	if before429 != 1 {
-		t.Fatalf("401 did not trigger exactly one recheck; calls=%d", before429)
+	if callsBeforeManualCheck != 0 {
+		t.Fatalf("usage event bypassed startup grace with %d host scans", callsBeforeManualCheck)
 	}
-	usage429, _ := json.Marshal(protocol.UsageRecord{Failed: true, AuthIndex: "one", Failure: protocol.UsageFailure{StatusCode: 429}})
+
+	checkRequest, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/account-health-pushover/check"})
+	value, err := p.Handle(protocol.MethodManagementHandle, checkRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := string(value.(protocol.ManagementResponse).Body); !strings.Contains(body, `"health": "healthy"`) || strings.Contains(body, bodySecret) {
+		t.Fatalf("active runtime did not override 401 or leaked body: %s", body)
+	}
+
+	host.mu.Lock()
+	host.entry.Status = "error"
+	host.entry.Unavailable = true
+	host.entry.StatusMessage = `{"provider":"opaque text"}`
+	host.entry.NextRetryAfter = time.Now().Add(time.Hour)
+	host.mu.Unlock()
+	usage429 := []byte(`{"Failed":true,"AuthIndex":"one","Failure":{"StatusCode":429,"Body":"` + bodySecret + `"}}`)
 	if _, err := p.Handle(protocol.MethodUsageHandle, usage429); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
-	host.mu.Lock()
-	after429 := host.listCalls
-	host.mu.Unlock()
-	if after429 != before429 {
-		t.Fatalf("429 scheduled account-health recheck; before=%d after=%d", before429, after429)
+	value, err = p.Handle(protocol.MethodManagementHandle, checkRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managementBody := string(value.(protocol.ManagementResponse).Body)
+	if !strings.Contains(managementBody, `"health": "quota_limited"`) || strings.Contains(managementBody, bodySecret) {
+		t.Fatalf("429 evidence was not quota-safe or leaked body: %s", managementBody)
+	}
+	resourceRequest, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/account-health-pushover/status"})
+	resource, err := p.Handle(protocol.MethodManagementHandle, resourceRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resourceBody := string(resource.(protocol.ManagementResponse).Body); strings.Contains(resourceBody, bodySecret) || strings.Contains(resourceBody, "http_429_quota") {
+		t.Fatalf("resource page leaked diagnostics: %s", resourceBody)
+	}
+	if count := notificationCount.Load(); count != 0 {
+		t.Fatalf("401/429 evidence sent %d credential notifications", count)
 	}
 }
 
@@ -206,5 +229,42 @@ func TestManagementStatusAndTestNotificationAreSecretSafe(t *testing.T) {
 		if strings.Contains(receivedMessage, forbidden) {
 			t.Fatalf("test message leaked %q", forbidden)
 		}
+	}
+}
+
+func TestResourceStatusRedactsAllDiagnosticsAndUsesClosedProviderNames(t *testing.T) {
+	secret := "RAW-DIAGNOSTIC-SECRET-SENTINEL"
+	status := monitor.Status{
+		MonitoringStale:     true,
+		LastMonitoringError: secret,
+		StateFile:           "/secret/state/path",
+		Notifier: notifier.Status{
+			LastError:     secret,
+			Configuration: config.CredentialStatus{State: "error", Error: secret},
+		},
+		Accounts: []monitor.AccountStatus{
+			{Provider: "claude", Label: "person@example.com", AuthIndex: "secret-index", Health: health.Suspect, ReasonCode: secret},
+			{Provider: "ßprovider", Label: "second@example.com", AuthIndex: "other-index", Health: health.Healthy, ReasonCode: secret},
+		},
+	}
+	redacted := redactResourceStatus(status)
+	encoded, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{secret, "/secret/state/path", "person@example.com", "second@example.com", "secret-index", "other-index"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("redacted resource retained %q: %s", forbidden, encoded)
+		}
+	}
+	page := string(renderStatusPage(redacted))
+	if !strings.Contains(page, "Claude OAuth account 1") || !strings.Contains(page, "OAuth account 1") {
+		t.Fatalf("provider names were not mapped to the closed display set: %s", page)
+	}
+	if strings.Contains(page, "window.prompt") || strings.Contains(page, "X-Management-Key") || strings.Contains(page, "<script") {
+		t.Fatalf("unauthenticated resource still collects a management key: %s", page)
+	}
+	if strings.Contains(page, "stale:") || !strings.Contains(page, ">stale<") {
+		t.Fatalf("resource stale marker exposed a dangling diagnostic: %s", page)
 	}
 }

@@ -1,6 +1,7 @@
 package health
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/config"
@@ -65,7 +66,12 @@ func TestSafeLabelRemovesControlsAndNeverUsesAccountField(t *testing.T) {
 	if got != "user name label" {
 		t.Fatalf("safe label = %q", got)
 	}
-	if got == entry.Account {
+	entry.Label = ""
+	entry.Name = ""
+	entry.AuthIndex = ""
+	if got := SafeLabel(entry); got != "unknown account" {
+		t.Fatalf("empty safe identifiers used an unsafe fallback: %q", got)
+	} else if strings.Contains(got, entry.Account) {
 		t.Fatal("safe label used the Account field, which may contain an API key")
 	}
 }

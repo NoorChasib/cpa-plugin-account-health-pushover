@@ -157,17 +157,3 @@ type HostLogRequest struct {
 	Message        string         `json:"message"`
 	Fields         map[string]any `json:"fields,omitempty"`
 }
-
-type UsageRecord struct {
-	Provider  string
-	AuthID    string
-	AuthIndex string
-	AuthType  string
-	Failed    bool
-	Failure   UsageFailure
-}
-
-type UsageFailure struct {
-	StatusCode int
-	Body       string
-}

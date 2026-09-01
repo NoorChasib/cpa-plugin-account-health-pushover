@@ -71,7 +71,7 @@ Priority `1` is high priority and bypasses quiet hours. Recovery priority `0` is
 
 ## Test
 
-From the browser status resource, choose **Test notification** and enter the CPA management key when prompted, or call:
+The browser status resource is intentionally read-only and never collects a management key. Invoke the authenticated Management API:
 
 ```bash
 curl -X POST \

@@ -31,6 +31,8 @@ type Config struct {
 	ScanInterval               time.Duration
 	StartupGrace               time.Duration
 	TransientConfirmAfter      time.Duration
+	UnauthorizedConfirmAfter   time.Duration
+	UsageRecheckDelay          time.Duration
 	NotifyRecovery             bool
 	NotifyDisabled             bool
 	NotifyRemoved              bool
@@ -57,6 +59,8 @@ type rawConfig struct {
 	ScanInterval               string   `yaml:"scan-interval"`
 	StartupGrace               string   `yaml:"startup-grace"`
 	TransientConfirmAfter      string   `yaml:"transient-confirm-after"`
+	UnauthorizedConfirmAfter   string   `yaml:"unauthorized-confirm-after"`
+	UsageRecheckDelay          string   `yaml:"usage-recheck-delay"`
 	NotifyRecovery             *bool    `yaml:"notify-recovery"`
 	NotifyDisabled             *bool    `yaml:"notify-disabled"`
 	NotifyRemoved              *bool    `yaml:"notify-removed"`
@@ -94,6 +98,8 @@ func Default() Config {
 		ScanInterval:               time.Minute,
 		StartupGrace:               30 * time.Second,
 		TransientConfirmAfter:      10 * time.Minute,
+		UnauthorizedConfirmAfter:   time.Minute,
+		UsageRecheckDelay:          10 * time.Second,
 		NotifyRecovery:             true,
 		NotifyDisabled:             false,
 		NotifyRemoved:              false,
@@ -133,6 +139,12 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.TransientConfirmAfter, err = parseDuration(raw.TransientConfirmAfter, cfg.TransientConfirmAfter, "transient-confirm-after"); err != nil {
+		return Config{}, err
+	}
+	if cfg.UnauthorizedConfirmAfter, err = parseDuration(raw.UnauthorizedConfirmAfter, cfg.UnauthorizedConfirmAfter, "unauthorized-confirm-after"); err != nil {
+		return Config{}, err
+	}
+	if cfg.UsageRecheckDelay, err = parseDuration(raw.UsageRecheckDelay, cfg.UsageRecheckDelay, "usage-recheck-delay"); err != nil {
 		return Config{}, err
 	}
 	if cfg.ReminderInterval, err = parseDuration(raw.ReminderInterval, cfg.ReminderInterval, "reminder-interval"); err != nil {
@@ -203,6 +215,15 @@ func (c *Config) Validate() error {
 	}
 	if c.StartupGrace < 0 || c.TransientConfirmAfter < 0 || c.ReminderInterval < 0 || c.NotificationCoalesceWindow < 0 || c.RemovedStateRetention < 0 {
 		return errors.New("duration settings must not be negative")
+	}
+	if c.UsageRecheckDelay < time.Second {
+		return errors.New("usage-recheck-delay must be at least 1s")
+	}
+	if c.UsageRecheckDelay > c.ScanInterval {
+		return errors.New("usage-recheck-delay must not exceed scan-interval")
+	}
+	if c.UnauthorizedConfirmAfter < time.Second {
+		return errors.New("unauthorized-confirm-after must be at least 1s")
 	}
 	if c.HTTPTimeout <= 0 {
 		return errors.New("pushover-http-timeout must be greater than zero")

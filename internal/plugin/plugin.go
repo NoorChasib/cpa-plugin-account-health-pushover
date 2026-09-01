@@ -21,6 +21,14 @@ var Version = "0.1.0"
 
 type Host = monitor.Host
 
+type usageFailureRecord struct {
+	AuthIndex string `json:"AuthIndex"`
+	Failed    bool   `json:"Failed"`
+	Failure   struct {
+		StatusCode int `json:"StatusCode"`
+	} `json:"Failure"`
+}
+
 type Plugin struct {
 	host     Host
 	endpoint string
@@ -90,24 +98,21 @@ func (p *Plugin) stop() {
 }
 
 func (p *Plugin) handleUsage(raw []byte) (map[string]any, error) {
-	var usage protocol.UsageRecord
+	// Decode only the fields account-health needs. In particular, Failure.Body
+	// is intentionally never materialized as a Go string, logged, persisted,
+	// rendered, classified, or copied into a notification.
+	var usage usageFailureRecord
 	if err := json.Unmarshal(raw, &usage); err != nil {
 		return nil, fmt.Errorf("decode usage record: %w", err)
 	}
 	if !usage.Failed || strings.TrimSpace(usage.AuthIndex) == "" {
 		return map[string]any{}, nil
 	}
-	switch usage.Failure.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout,
-		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		p.mu.RLock()
-		current := p.monitor
-		p.mu.RUnlock()
-		if current != nil {
-			current.Signal(usage.AuthIndex)
-		}
-	case http.StatusTooManyRequests:
-		// Quota/rate limiting is intentionally not an account-down signal.
+	p.mu.RLock()
+	current := p.monitor
+	p.mu.RUnlock()
+	if current != nil {
+		current.ObserveUsageFailure(usage.AuthIndex, usage.Failure.StatusCode)
 	}
 	return map[string]any{}, nil
 }
@@ -194,8 +199,10 @@ func configFields() []protocol.ConfigField {
 	return []protocol.ConfigField{
 		field("providers", "array", "OAuth providers to monitor. Supported values: claude, codex."),
 		field("scan-interval", "string", "Full health reconciliation interval (default 1m)."),
-		field("startup-grace", "string", "Delay before the first baseline scan; current usage failures can trigger an earlier recheck (default 30s)."),
-		field("transient-confirm-after", "string", "How long ambiguous failures remain suspect before credential_down (default 10m)."),
+		field("startup-grace", "string", "Delay before the first baseline scan; usage events retain status evidence but cannot bypass it (default 30s)."),
+		field("transient-confirm-after", "string", "How long transient and ambiguous failures remain suspect before credential_down (default 10m)."),
+		field("unauthorized-confirm-after", "string", "How long continuing recent request-level 401 evidence must remain unresolved before reauthentication is required; evidence expires after 2m unless repeated 401s refresh it (default 1m)."),
+		field("usage-recheck-delay", "string", "Delay that allows CPA OAuth refresh to finish before usage-triggered reconciliation; must not exceed scan-interval (default 10s)."),
 		field("notify-recovery", "boolean", "Send one recovery notification after an alerted incident (default true)."),
 		field("notify-disabled", "boolean", "Send informational disabled notifications (default false)."),
 		field("notify-removed", "boolean", "Send informational removed notifications (default false)."),
@@ -238,7 +245,7 @@ func htmlResponse(status int, body []byte) protocol.ManagementResponse {
 		Headers: http.Header{
 			"content-type":            []string{"text/html; charset=utf-8"},
 			"cache-control":           []string{"no-store"},
-			"content-security-policy": []string{"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'"},
+			"content-security-policy": []string{"default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'"},
 			"x-content-type-options":  []string{"nosniff"},
 			"referrer-policy":         []string{"no-referrer"},
 		},

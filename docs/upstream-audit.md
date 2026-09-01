@@ -48,7 +48,8 @@ Primary audited paths:
 - This plugin declares `usage_plugin` and `management_api`.
 - It handles `plugin.quiesce` and the exported shutdown callback by stopping background workers.
 - The usage record wire shape is PascalCase and includes `Provider`, `AuthID`, `AuthIndex`, `Failed`, and `Failure.StatusCode`/`Failure.Body`.
-- Usage callbacks have no request-scoped host callback ID. This implementation only queues an auth-index signal and returns.
+- This implementation intentionally decodes only `AuthIndex`, `Failed`, and `Failure.StatusCode`. `Failure.Body` is skipped by `encoding/json` and is never materialized, classified, logged, persisted, rendered, or copied into a notification.
+- Usage callbacks have no request-scoped host callback ID. This implementation records bounded status-code evidence, queues a non-blocking wake, and returns. Reconciliation waits for `usage-recheck-delay` and cannot bypass `startup-grace`.
 
 ## Host callbacks used
 
@@ -125,7 +126,9 @@ At the audited commit, `host.auth.get_runtime` does **not** expose the full inte
 - `NextRefreshAfter`;
 - model states.
 
-Therefore v0.1 classifies callback-visible health conservatively from current `status`, `status_message`, `disabled`, `unavailable`, `next_retry_after`, and current usage-event status codes. It still defines and tests richer classifier fields so a future adapter can populate them when upstream exposes them.
+Therefore v0.1 classifies callback-visible health conservatively from current `status`, an exact closed mapping of canonical `status_message` values, `disabled`, `unavailable`, `next_retry_after`, and recent structured usage-event HTTP status evidence. A structured 429 is always quota-limited even when provider prose is arbitrary. A request-level 401 remains `suspect` until CPA has had time to refresh and the condition persists; exact refresh-path rejection remains definitive. Unknown provider prose is never converted into an external reason code, and an otherwise unclassified cooldown stays non-promotable rather than being declared a broken credential. Expiry of the retry timestamp alone does not prove recovery; CPA must report active/available or provide new typed evidence.
+
+`NextRetryAfter` is deliberately not treated as quota evidence by itself. At the audited commit CPA uses that field for quota, 401, 403, 404, and transient 5xx cooldowns, so doing so would hide real credential or upstream failures. Recent structured evidence expires after a short TTL and is cleared by a newer or active/available runtime observation.
 
 The plugin does not call `host.auth.get` to fill the gap. That callback returns raw auth-file JSON containing OAuth/access/refresh tokens and is unnecessary for current safe identity because list/runtime entries already expose `email`, `label`, `name`, and `auth_index`.
 
@@ -145,7 +148,7 @@ Without an explicit override, state loading waits until the host roster exposes 
 
 Management routes are registered under `/v0/management` and pass through CPA's management-key authentication. This plugin registers relative route paths under `/plugins/account-health-pushover/...`.
 
-Resource routes are registered under `/v0/resource/plugins/<plugin-id>` and are unauthenticated in current CPA. The browser status resource masks account labels/email addresses and auth indexes, omits the state path, and contains only sanitized metadata. The authenticated Management status route retains exact safe labels/indexes. Operators should still keep CPA's API port within the intended private network/reverse proxy.
+Resource routes are registered under `/v0/resource/plugins/<plugin-id>` and are unauthenticated in current CPA. The read-only browser status resource contains no script and masks account labels/email addresses, auth indexes, closed reason diagnostics, notifier/monitoring errors, and the state path. It never solicits a management key. The authenticated Management status route retains exact safe labels/indexes and closed reason codes. Operators should still keep CPA's API port within the intended private network/reverse proxy.
 
 ## Optional probes
 

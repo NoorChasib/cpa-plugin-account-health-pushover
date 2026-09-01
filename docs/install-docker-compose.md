@@ -86,6 +86,8 @@ plugins:
       scan-interval: 1m
       startup-grace: 30s
       transient-confirm-after: 10m
+      unauthorized-confirm-after: 1m
+      usage-recheck-delay: 10s
       notify-recovery: true
       notify-disabled: false
       notify-removed: false
@@ -145,7 +147,7 @@ No code-level imports or runtime dependency connect the projects.
 5. Verify:
 
    ```bash
-   docker exec cli-proxy-api ls -lah /CLIProxyAPI/plugins
+   docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
    docker logs --tail=200 cli-proxy-api
    ```
 
@@ -155,8 +157,8 @@ No code-level imports or runtime dependency connect the projects.
    /v0/resource/plugins/account-health-pushover/status
    ```
 
-7. Run **Test notification** and confirm Pushover receives the safe test message.
-8. Run **Check now** and confirm Claude/Codex accounts appear.
+7. Invoke **Test notification** through CPA's authenticated Management API and confirm Pushover receives the safe test message.
+8. Invoke **Check now** through the authenticated Management API and confirm Claude/Codex accounts appear.
 9. Recreate/redeploy the container and verify the plugin remains installed.
 
 ## Manual pre-release install

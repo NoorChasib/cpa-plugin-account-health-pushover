@@ -36,7 +36,7 @@ The root registry is schema version 1 and contains one plugin entry. CPA continu
 8. Add the plugin config and Pushover secret environment variables.
 9. Restart/reload CPA.
 10. Open `/v0/resource/plugins/account-health-pushover/status`.
-11. Run **Test notification** and **Check now**.
+11. Invoke **Test notification** and **Check now** through CPA's authenticated Management API.
 
 Current CPA derives the plugin ID from the installed library basename and accepts both the unversioned form `account-health-pushover.<ext>` and the versioned form `account-health-pushover-v<X.Y.Z>.<ext>`. The Plugin Store installer writes the versioned form to `<plugins-dir>/<goos>/<goarch>/account-health-pushover-v<X.Y.Z>.<ext>`; the host searches that platform directory before the plugins root, so manual root installs also load.
 
@@ -54,7 +54,7 @@ account-health-pushover.dll
 2. Refresh the Plugin Store.
 3. Choose update for `account-health-pushover`.
 4. Restart/reload CPA if requested by the current Management Center.
-5. Verify status, run **Test notification**, and run **Check now**.
+5. Verify the read-only resource status, then invoke **Test notification** and **Check now** through CPA's authenticated Management API.
 6. Confirm the installed binary remains after a container recreation.
 
 CPA selects release assets by exact runtime GOOS/GOARCH. An update is unavailable if that release does not contain the matching archive.

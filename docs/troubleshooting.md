@@ -40,7 +40,7 @@ The status error is intentionally sanitized. Use Pushover's dashboard and CPA ne
 
 ## Accounts do not appear
 
-Run **Check now**, then verify:
+Invoke **Check now** through CPA's authenticated Management API, then verify:
 
 - provider is `claude` or `codex`;
 - the credential is OAuth, not an API key;
@@ -58,19 +58,19 @@ This is not a credential incident and does not send a failure notification. Expe
 - weekly limit;
 - Claude Fable/model-scoped limit;
 - HTTP 429;
-- current quota cooldown.
+- a canonical quota cooldown or recent structured HTTP 429 observation.
 
 Routing resumes according to CPA's own cooldown logic.
 
 ## Account shows `suspect`
 
-A current condition is ambiguous, such as a timeout, provider 5xx, network failure, or non-definitive 403. The default confirmation period is 10 minutes. A first ambiguous failure does not alert.
+A current condition is ambiguous, such as a request-level 401, timeout, provider 5xx, network failure, non-definitive 403, or an unclassified future cooldown. A first ambiguous failure does not alert. Typed transient evidence uses the 10-minute `transient-confirm-after` threshold; request-level 401 evidence uses the 1-minute `unauthorized-confirm-after` threshold after the delayed recheck gives CPA time to refresh. Request evidence expires after 2 minutes, so a longer unauthorized threshold requires repeated 401s to keep the evidence current.
 
-If the runtime returns healthy during confirmation, the state clears silently. If it remains a non-quota credential failure past the threshold, it becomes `credential_down` and alerts once.
+If the runtime returns active and available during confirmation, the state clears silently. Persistent request-level 401 evidence becomes `reauth_required`; persistent typed transient evidence becomes `credential_down`. An unknown cooldown remains non-promotable rather than being guessed to be either quota or credential failure. An elapsed retry timestamp alone is not treated as recovery; CPA must report the auth active and available.
 
 ## Account shows `reauth_required`
 
-Current CPA runtime reported definitive unauthorized/invalid-grant evidence. Reauthenticate through CPA's normal provider flow. After CPA shows the auth active/available, run **Check now** or wait for the next scan. One recovery notification is sent only if the incident alert was accepted by Pushover.
+Current CPA runtime reported exact definitive refresh-path unauthorized/invalid-grant evidence, or request-level 401 evidence persisted beyond confirmation. Reauthenticate through CPA's normal provider flow. After CPA shows the auth active/available, invoke **Check now** through the authenticated Management API or wait for the next scan. One recovery notification is sent only if the incident alert was accepted by Pushover.
 
 ## Duplicate alerts after restart
 
@@ -94,13 +94,13 @@ A `host.auth.list` or one/more `host.auth.get_runtime` callback failed. The plug
 
 ## Status resource exposure
 
-Current CPA resource routes are unauthenticated. The page masks account labels/email addresses and auth indexes and excludes state paths, tokens, and raw auth JSON. Keep CPA's port on the intended private network or protect it with the deployment reverse proxy. The authenticated Management status endpoint retains exact safe labels/indexes, and Management actions remain protected by CPA's management key.
+Current CPA resource routes are unauthenticated. The page is read-only, contains no script, never solicits a management key, and masks account labels/email addresses, auth indexes, reason diagnostics, notifier/monitoring errors, and state paths. It excludes tokens, raw auth JSON, and upstream response bodies. Keep CPA's port on the intended private network or protect it with the deployment reverse proxy. The authenticated Management status endpoint retains exact safe labels/indexes and closed reason codes, and Management actions remain protected by CPA's management key.
 
 ## Incident response checklist
 
 1. Confirm whether the row is `quota_limited` or a real failure.
 2. For `reauth_required`, complete provider sign-in through CPA.
 3. For `credential_down`, inspect CPA auth status/provider availability; do not rotate credentials solely because one transient provider request failed.
-4. Run **Check now** after corrective action.
+4. Invoke **Check now** through CPA's authenticated Management API after corrective action.
 5. Confirm exactly one recovery arrives.
 6. Confirm status contains no tokens or Pushover values.

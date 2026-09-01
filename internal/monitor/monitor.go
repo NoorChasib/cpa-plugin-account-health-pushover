@@ -18,7 +18,10 @@ import (
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/state"
 )
 
-const notificationRetryAfter = 5 * time.Minute
+const (
+	notificationRetryAfter = 5 * time.Minute
+	failureEvidenceTTL     = 2 * time.Minute
+)
 
 // stopWaitBound caps how long Stop waits for the reconcile loop to exit after
 // cancellation, so host lifecycle calls (quiesce, reconfigure, shutdown)
@@ -81,9 +84,10 @@ type Monitor struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	signals   chan string
+	signals   chan struct{}
 	pendingMu sync.Mutex
 	pending   map[string]struct{}
+	evidence  map[string]health.FailureEvidence
 	aliases   map[string]string
 }
 
@@ -101,11 +105,12 @@ func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *noti
 			PluginEnabled:   cfg.Enabled,
 			StateFileHealth: "not_initialized",
 		},
-		ctx:     ctx,
-		cancel:  cancel,
-		signals: make(chan string, 64),
-		pending: make(map[string]struct{}),
-		aliases: make(map[string]string),
+		ctx:      ctx,
+		cancel:   cancel,
+		signals:  make(chan struct{}, 1),
+		pending:  make(map[string]struct{}),
+		evidence: make(map[string]health.FailureEvidence),
+		aliases:  make(map[string]string),
 	}
 }
 
@@ -144,21 +149,21 @@ func (m *Monitor) loop() {
 	defer m.wg.Done()
 	startup := time.NewTimer(m.cfg.StartupGrace)
 	defer startup.Stop()
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-startup.C:
-			_ = m.Reconcile(m.ctx, "startup")
-			goto periodic
-		case authIndex := <-m.signals:
-			if !m.processSignal(authIndex) {
-				return
-			}
-		}
+	select {
+	case <-m.ctx.Done():
+		return
+	case <-startup.C:
 	}
 
-periodic:
+	// Usage events received during startup grace retain their structured status
+	// evidence, but cannot bypass the baseline delay. Drain the old wake before
+	// clearing its pending markers: an event arriving after the drain then leaves
+	// a wake queued for a follow-up scan, while an earlier event is included in
+	// the baseline through its retained evidence.
+	m.drainSignalWake()
+	m.takePendingBatch()
+	_ = m.Reconcile(m.ctx, "startup")
+
 	ticker := time.NewTicker(m.cfg.ScanInterval)
 	defer ticker.Stop()
 	m.setNextScan(m.now().Add(m.cfg.ScanInterval))
@@ -169,49 +174,102 @@ periodic:
 		case <-ticker.C:
 			_ = m.Reconcile(m.ctx, "periodic")
 			m.setNextScan(m.now().Add(m.cfg.ScanInterval))
-		case authIndex := <-m.signals:
-			if !m.processSignal(authIndex) {
+		case <-m.signals:
+			if !m.processSignals() {
 				return
 			}
 		}
 	}
 }
 
-func (m *Monitor) processSignal(authIndex string) bool {
-	timer := time.NewTimer(100 * time.Millisecond)
+func (m *Monitor) processSignals() bool {
+	timer := time.NewTimer(m.cfg.UsageRecheckDelay)
 	defer timer.Stop()
 	select {
 	case <-m.ctx.Done():
 		return false
 	case <-timer.C:
 	}
+	m.takePendingBatch()
 	_ = m.Reconcile(m.ctx, "usage_failure")
-	m.pendingMu.Lock()
-	delete(m.pending, authIndex)
-	m.pendingMu.Unlock()
 	return true
 }
 
-func (m *Monitor) Signal(authIndex string) bool {
+func (m *Monitor) takePendingBatch() {
+	m.pendingMu.Lock()
+	m.pending = make(map[string]struct{})
+	m.pendingMu.Unlock()
+}
+
+func (m *Monitor) drainSignalWake() {
+	select {
+	case <-m.signals:
+	default:
+	}
+}
+
+func (m *Monitor) ObserveUsageFailure(authIndex string, statusCode int) bool {
 	authIndex = strings.TrimSpace(authIndex)
-	if authIndex == "" || !m.cfg.Enabled {
+	if authIndex == "" || !m.cfg.Enabled || !supportedFailureStatus(statusCode) {
 		return false
 	}
 	m.pendingMu.Lock()
+	m.evidence[authIndex] = health.FailureEvidence{HTTPStatus: statusCode, ObservedAt: m.now().UTC()}
 	if _, exists := m.pending[authIndex]; exists {
 		m.pendingMu.Unlock()
 		return true
 	}
+	wasEmpty := len(m.pending) == 0
 	m.pending[authIndex] = struct{}{}
 	m.pendingMu.Unlock()
+	if !wasEmpty {
+		return true
+	}
 	select {
-	case m.signals <- authIndex:
+	case m.signals <- struct{}{}:
 		return true
 	default:
-		m.pendingMu.Lock()
-		delete(m.pending, authIndex)
-		m.pendingMu.Unlock()
+		return true
+	}
+}
+
+func supportedFailureStatus(statusCode int) bool {
+	switch statusCode {
+	case 401, 403, 408, 429, 500, 502, 503, 504:
+		return true
+	default:
 		return false
+	}
+}
+
+func (m *Monitor) failureEvidenceFor(entry protocol.HostAuthFileEntry, now time.Time) health.FailureEvidence {
+	authIndex := strings.TrimSpace(entry.AuthIndex)
+	m.pendingMu.Lock()
+	defer m.pendingMu.Unlock()
+	evidence := m.evidence[authIndex]
+	if evidence.HTTPStatus == 0 {
+		return health.FailureEvidence{}
+	}
+	if now.Sub(evidence.ObservedAt) > failureEvidenceTTL || (!entry.UpdatedAt.IsZero() && entry.UpdatedAt.After(evidence.ObservedAt)) || (strings.EqualFold(strings.TrimSpace(entry.Status), "active") && !entry.Unavailable) {
+		delete(m.evidence, authIndex)
+		return health.FailureEvidence{}
+	}
+	return evidence
+}
+
+func (m *Monitor) pruneFailureEvidence(candidates []protocol.HostAuthFileEntry, now time.Time) {
+	active := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		active[strings.TrimSpace(candidate.AuthIndex)] = struct{}{}
+	}
+	m.pendingMu.Lock()
+	defer m.pendingMu.Unlock()
+	for authIndex, evidence := range m.evidence {
+		_, exists := active[authIndex]
+		if !exists || now.Sub(evidence.ObservedAt) > failureEvidenceTTL {
+			delete(m.evidence, authIndex)
+			delete(m.pending, authIndex)
+		}
 	}
 }
 
@@ -227,6 +285,7 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 		return err
 	}
 	candidates := health.Discover(roster, m.cfg)
+	m.pruneFailureEvidence(candidates, now)
 	m.ensureStateLoaded(roster)
 
 	type result struct {
@@ -261,7 +320,8 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 			if runtimeEntry.AuthIndex == "" {
 				runtimeEntry.AuthIndex = candidate.AuthIndex
 			}
-			snapshot := health.FromHostEntry(runtimeEntry, now)
+			evidence := m.failureEvidenceFor(runtimeEntry, now)
+			snapshot := health.FromHostEntry(runtimeEntry, evidence, now)
 			classifier := m.classifiers[snapshot.Provider]
 			if classifier == nil {
 				results <- result{entry: candidate, err: fmt.Errorf("no classifier for provider %s", snapshot.Provider)}
@@ -408,16 +468,42 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 	}
 
 	newState := observation.State
+	firstDetected := time.Time{}
 	if newState == health.Suspect {
-		if account.SuspectSince.IsZero() {
-			account.SuspectSince = now
+		if observation.Confirmation == health.ConfirmationNone || !health.IsFailure(observation.ConfirmAs) {
+			clearSuspect(account)
+		} else {
+			// A sustained outage can alternate among status codes within the same
+			// confirmation class (for example 502/503). Reset only when the class
+			// or target meaningfully changes, while retaining the latest closed
+			// reason code for a future promotion.
+			if account.SuspectSince.IsZero() || account.SuspectClass != observation.Confirmation || account.SuspectTarget != observation.ConfirmAs {
+				account.SuspectSince = now
+				account.SuspectClass = observation.Confirmation
+				account.SuspectTarget = observation.ConfirmAs
+			}
+			account.SuspectReason = observation.ReasonCode
+			confirmAfter := m.cfg.TransientConfirmAfter
+			if observation.Confirmation == health.ConfirmationUnauthorized {
+				confirmAfter = m.cfg.UnauthorizedConfirmAfter
+			}
+			if confirmAfter == 0 || !account.SuspectSince.Add(confirmAfter).After(now) {
+				firstDetected = account.SuspectSince
+				newState = observation.ConfirmAs
+				observation.ReasonCode = health.PersistentReason(observation.ReasonCode)
+				clearSuspect(account)
+			}
 		}
-		if m.cfg.TransientConfirmAfter == 0 || !account.SuspectSince.Add(m.cfg.TransientConfirmAfter).After(now) {
-			newState = health.CredentialDown
-			observation.ReasonCode = confirmedReason(observation.ReasonCode)
+		// An ambiguous observation cannot prove that an already-confirmed
+		// credential incident recovered. Keep the confirmed external state (and
+		// reminder/dedupe generation) until a credential-healthy, disabled,
+		// removed, or differently confirmed observation provides a transition.
+		if newState == health.Suspect && health.IsFailure(account.Health) {
+			newState = account.Health
+			observation.ReasonCode = account.LastReasonCode
 		}
 	} else {
-		account.SuspectSince = time.Time{}
+		clearSuspect(account)
 	}
 
 	previous := account.Health
@@ -432,8 +518,8 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 				if account.IncidentGeneration == 0 {
 					account.IncidentGeneration = 1
 				}
-				if previous == health.Suspect && !account.SuspectSince.IsZero() {
-					account.FirstDetectedAt = account.SuspectSince
+				if !firstDetected.IsZero() {
+					account.FirstDetectedAt = firstDetected
 				} else {
 					account.FirstDetectedAt = now
 				}
@@ -476,6 +562,13 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 			m.enqueueRecoveryLocked(account, now)
 		}
 	}
+}
+
+func clearSuspect(account *state.Account) {
+	account.SuspectSince = time.Time{}
+	account.SuspectClass = health.ConfirmationNone
+	account.SuspectTarget = health.Unknown
+	account.SuspectReason = health.ReasonNone
 }
 
 func (m *Monitor) correlatedKeyLocked(snapshot health.RuntimeSnapshot, activeKeys map[string]struct{}) string {
@@ -550,7 +643,7 @@ func (m *Monitor) markRemoved(activeKeys map[string]struct{}, now time.Time) {
 		account.Health = health.Removed
 		account.RemovedAt = now
 		account.LastChangedAt = now
-		account.LastReasonCode = "removed"
+		account.LastReasonCode = health.ReasonRemoved
 		account.AlertSent = false
 		account.RecoveryPendingFrom = ""
 		if m.cfg.NotifyRemoved {
@@ -722,7 +815,7 @@ func (m *Monitor) failureMessage(account *state.Account, reminder bool, now time
 		Provider:   provider,
 		AccountKey: account.AccountKey,
 		Label:      account.Label,
-		Reason:     account.LastReasonCode,
+		Reason:     string(account.LastReasonCode),
 	}
 }
 
@@ -791,7 +884,7 @@ func accountStatuses(data state.Data, reminderInterval time.Duration) []AccountS
 			CPAStatus:                       account.CPAStatus,
 			CPAUnavailable:                  account.CPAUnavailable,
 			QuotaLimited:                    account.QuotaLimited,
-			ReasonCode:                      account.LastReasonCode,
+			ReasonCode:                      string(account.LastReasonCode),
 			FirstDetectedAt:                 account.FirstDetectedAt,
 			LastTransitionAt:                account.LastChangedAt,
 			LastSuccessfulHealthObservation: account.LastSuccessfulHealthObservation,
@@ -829,16 +922,6 @@ func (m *Monitor) effectiveRemovedStateRetention() time.Duration {
 
 func due(last time.Time, interval time.Duration, now time.Time) bool {
 	return last.IsZero() || !last.Add(interval).After(now)
-}
-
-func confirmedReason(reason string) string {
-	if reason == "" {
-		return "persistent_credential_error"
-	}
-	if strings.HasPrefix(reason, "persistent_") {
-		return reason
-	}
-	return "persistent_" + reason
 }
 
 func titleProvider(provider string) string {

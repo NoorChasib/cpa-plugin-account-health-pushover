@@ -16,31 +16,34 @@ import (
 const CurrentVersion = 1
 
 type Account struct {
-	AccountKey                      string       `json:"account_key"`
-	Provider                        string       `json:"provider"`
-	AuthIndex                       string       `json:"auth_index"`
-	Label                           string       `json:"label"`
-	Identity                        string       `json:"identity,omitempty"`
-	Health                          health.State `json:"health"`
-	PreviousHealth                  health.State `json:"previous_health,omitempty"`
-	FirstDetectedAt                 time.Time    `json:"first_detected_at,omitempty"`
-	LastChangedAt                   time.Time    `json:"last_changed_at,omitempty"`
-	LastAlertAt                     time.Time    `json:"last_alert_at,omitempty"`
-	LastAlertAttemptAt              time.Time    `json:"last_alert_attempt_at,omitempty"`
-	LastAlertAttemptGeneration      uint64       `json:"last_alert_attempt_generation,omitempty"`
-	LastRecoveryAt                  time.Time    `json:"last_recovery_at,omitempty"`
-	LastRecoveryAttemptAt           time.Time    `json:"last_recovery_attempt_at,omitempty"`
-	LastReasonCode                  string       `json:"last_reason_code,omitempty"`
-	AlertSent                       bool         `json:"alert_sent"`
-	IncidentGeneration              uint64       `json:"incident_generation,omitempty"`
-	RecoveryPendingFrom             health.State `json:"recovery_pending_from,omitempty"`
-	SuspectSince                    time.Time    `json:"suspect_since,omitempty"`
-	RemovedAt                       time.Time    `json:"removed_at,omitempty"`
-	LastSuccessfulHealthObservation time.Time    `json:"last_successful_health_observation,omitempty"`
-	LastObservedAt                  time.Time    `json:"last_observed_at,omitempty"`
-	CPAStatus                       string       `json:"cpa_status,omitempty"`
-	CPAUnavailable                  bool         `json:"cpa_unavailable"`
-	QuotaLimited                    bool         `json:"quota_limited"`
+	AccountKey                      string                   `json:"account_key"`
+	Provider                        string                   `json:"provider"`
+	AuthIndex                       string                   `json:"auth_index"`
+	Label                           string                   `json:"label"`
+	Identity                        string                   `json:"identity,omitempty"`
+	Health                          health.State             `json:"health"`
+	PreviousHealth                  health.State             `json:"previous_health,omitempty"`
+	FirstDetectedAt                 time.Time                `json:"first_detected_at,omitempty"`
+	LastChangedAt                   time.Time                `json:"last_changed_at,omitempty"`
+	LastAlertAt                     time.Time                `json:"last_alert_at,omitempty"`
+	LastAlertAttemptAt              time.Time                `json:"last_alert_attempt_at,omitempty"`
+	LastAlertAttemptGeneration      uint64                   `json:"last_alert_attempt_generation,omitempty"`
+	LastRecoveryAt                  time.Time                `json:"last_recovery_at,omitempty"`
+	LastRecoveryAttemptAt           time.Time                `json:"last_recovery_attempt_at,omitempty"`
+	LastReasonCode                  health.ReasonCode        `json:"last_reason_code,omitempty"`
+	AlertSent                       bool                     `json:"alert_sent"`
+	IncidentGeneration              uint64                   `json:"incident_generation,omitempty"`
+	RecoveryPendingFrom             health.State             `json:"recovery_pending_from,omitempty"`
+	SuspectSince                    time.Time                `json:"suspect_since,omitempty"`
+	SuspectClass                    health.ConfirmationClass `json:"suspect_class,omitempty"`
+	SuspectTarget                   health.State             `json:"suspect_target,omitempty"`
+	SuspectReason                   health.ReasonCode        `json:"suspect_reason,omitempty"`
+	RemovedAt                       time.Time                `json:"removed_at,omitempty"`
+	LastSuccessfulHealthObservation time.Time                `json:"last_successful_health_observation,omitempty"`
+	LastObservedAt                  time.Time                `json:"last_observed_at,omitempty"`
+	CPAStatus                       string                   `json:"cpa_status,omitempty"`
+	CPAUnavailable                  bool                     `json:"cpa_unavailable"`
+	QuotaLimited                    bool                     `json:"quota_limited"`
 }
 
 type Data struct {
@@ -86,6 +89,27 @@ func (s Store) Load() (Data, error) {
 			continue
 		}
 		account.AccountKey = key
+		account.LastReasonCode = health.NormalizeReasonCode(string(account.LastReasonCode))
+		if account.Health == health.Suspect {
+			validClass := account.SuspectClass == health.ConfirmationTransient || account.SuspectClass == health.ConfirmationUnauthorized
+			validTarget := account.SuspectTarget == health.CredentialDown || account.SuspectTarget == health.ReauthRequired
+			if !validClass || !validTarget || account.SuspectReason == health.ReasonNone {
+				account.SuspectSince = time.Time{}
+				account.SuspectClass = health.ConfirmationNone
+				account.SuspectTarget = health.Unknown
+				account.SuspectReason = health.ReasonNone
+			} else {
+				account.SuspectReason = health.NormalizeReasonCode(string(account.SuspectReason))
+			}
+		} else {
+			account.SuspectSince = time.Time{}
+			account.SuspectClass = health.ConfirmationNone
+			account.SuspectTarget = health.Unknown
+			account.SuspectReason = health.ReasonNone
+		}
+	}
+	if data.LastNotificationErr != "" {
+		data.LastNotificationErr = "previous notification delivery failed"
 	}
 	return data, nil
 }

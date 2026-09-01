@@ -9,13 +9,14 @@ It deliberately does **not** alert for ordinary quota consumption. Five-hour lim
 - Dynamically discovers Claude and Codex OAuth credentials through `host.auth.list`.
 - Reads current runtime health through `host.auth.get_runtime`.
 - Classifies accounts as `healthy`, `quota_limited`, `suspect`, `credential_down`, `reauth_required`, `disabled`, or `removed`.
-- Immediately alerts on definitive current `unauthorized`/`invalid_grant` runtime states.
+- Immediately alerts on exact definitive refresh-path `unauthorized`/`invalid_grant` runtime states.
+- Confirms request-level 401 evidence for 1 minute by default, giving CPA time to refresh successfully before declaring `reauth_required`.
 - Confirms transient network/5xx errors for 10 minutes by default before declaring `credential_down`.
 - Persists incident/delivery state to prevent restart spam.
 - Sends one recovery notification after an alerted account becomes credential-healthy again.
 - Supports 12-hour unresolved-incident reminders by default; `0` disables reminders.
 - Coalesces simultaneous notifications in a bounded asynchronous worker.
-- Uses failed usage records only to schedule lightweight immediate runtime rechecks; it never sends from the request callback.
+- Decodes only `AuthIndex`, `Failed`, and `Failure.StatusCode` from failed usage records, retains that structured status evidence briefly, and schedules a delayed runtime recheck; it never materializes the failure body or sends from the request callback.
 - Provides authenticated status, **Check now**, and **Test notification** Management routes plus a browser status resource.
 - Never changes credential priority, routing policy, quota state, OAuth tokens, or auth files.
 
@@ -81,6 +82,8 @@ plugins:
       scan-interval: 1m
       startup-grace: 30s
       transient-confirm-after: 10m
+      unauthorized-confirm-after: 1m
+      usage-recheck-delay: 10s
       notify-recovery: true
       notify-disabled: false
       notify-removed: false
@@ -113,7 +116,7 @@ Full deployment instructions: [docs/install-docker-compose.md](docs/install-dock
 5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.1.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
 6. Add the two Coolify secret variables and enable the plugin config.
 7. Restart/reload CPA.
-8. Open the plugin status resource, use **Test notification**, then use **Check now**.
+8. Open the read-only plugin status resource, then invoke **Test notification** and **Check now** through CPA's authenticated Management API.
 
 The official CPA registry remains enabled when custom sources are added. See [docs/custom-plugin-store.md](docs/custom-plugin-store.md) for install, update, rollback, and uninstall.
 
@@ -161,7 +164,7 @@ Browser resource:
 GET /v0/resource/plugins/account-health-pushover/status
 ```
 
-Current CPA resource routes are unauthenticated by design. Keep port 8317 behind the intended private network/reverse proxy. The resource masks account labels and auth indexes and renders only sanitized monitoring metadata—never email addresses, raw auth JSON, OAuth tokens, Pushover values, state paths, or upstream response bodies. The authenticated Management status endpoint retains exact safe labels/indexes for operators. Resource action buttons prompt for the management key and do not store it.
+Current CPA resource routes are unauthenticated by design. Keep port 8317 behind the intended private network/reverse proxy. The resource is read-only, contains no script, never collects a management key, and masks account labels, auth indexes, closed reason diagnostics, notifier errors, monitoring errors, and state paths. It never renders email addresses, raw auth JSON, OAuth tokens, Pushover values, or upstream response bodies. The authenticated Management status endpoint retains exact safe labels/indexes and closed reason codes for operators.
 
 Example API actions:
 
@@ -184,8 +187,10 @@ Do not paste the management key into shell history on shared systems; use an env
 |---|---:|---|
 | `providers` | `[claude, codex]` | OAuth providers monitored dynamically. |
 | `scan-interval` | `1m` | Full roster/runtime reconciliation interval. |
-| `startup-grace` | `30s` | Initial grace before baseline classification; current 401/403/408/5xx usage failures intentionally trigger an earlier recheck. |
-| `transient-confirm-after` | `10m` | Confirmation time before `suspect` becomes `credential_down`. |
+| `startup-grace` | `30s` | Initial grace before baseline classification; usage evidence is retained but cannot bypass this delay. |
+| `transient-confirm-after` | `10m` | Confirmation time before a typed transient `suspect` becomes `credential_down`. |
+| `unauthorized-confirm-after` | `1m` | Confirmation time before continuing recent request-level 401 evidence becomes `reauth_required`; exact refresh-path rejection remains immediate. Request evidence expires after 2 minutes, so longer windows confirm only while repeated 401s refresh that evidence. |
+| `usage-recheck-delay` | `10s` | Delay before a usage-triggered reconciliation so CPA's synchronous OAuth refresh can finish; must not exceed `scan-interval`. |
 | `notify-recovery` | `true` | Send one recovery after an alerted incident. |
 | `notify-disabled` | `false` | Optional informational disabled notice. |
 | `notify-removed` | `false` | Optional informational removed notice. |

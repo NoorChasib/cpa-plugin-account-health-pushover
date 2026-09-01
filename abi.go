@@ -213,6 +213,9 @@ func callHost(ctx context.Context, method string, payload any) (json.RawMessage,
 	if response.ptr != nil {
 		C.free_host_buffer(response.ptr, response.len)
 	}
+	if code != 0 {
+		return nil, fmt.Errorf("host callback %s returned code %d", method, int(code))
+	}
 	if len(rawResponse) == 0 {
 		return nil, fmt.Errorf("host callback %s returned no response", method)
 	}
@@ -225,9 +228,6 @@ func callHost(ctx context.Context, method string, payload any) (json.RawMessage,
 			return nil, fmt.Errorf("host callback %s failed: %s", method, envelope.Error.Code)
 		}
 		return nil, fmt.Errorf("host callback %s failed", method)
-	}
-	if code != 0 {
-		return nil, fmt.Errorf("host callback %s returned code %d", method, int(code))
 	}
 	return append(json.RawMessage(nil), envelope.Result...), nil
 }

@@ -13,7 +13,7 @@ func TestParseDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ScanInterval != time.Minute || cfg.StartupGrace != 30*time.Second || cfg.TransientConfirmAfter != 10*time.Minute {
+	if cfg.ScanInterval != time.Minute || cfg.StartupGrace != 30*time.Second || cfg.TransientConfirmAfter != 10*time.Minute || cfg.UnauthorizedConfirmAfter != time.Minute || cfg.UsageRecheckDelay != 10*time.Second {
 		t.Fatalf("unexpected default durations: %+v", cfg)
 	}
 	if !cfg.NotifyRecovery || cfg.NotifyDisabled || cfg.NotifyRemoved {
@@ -31,6 +31,8 @@ providers: [Codex, claude, codex]
 scan-interval: 2m
 startup-grace: 5s
 transient-confirm-after: 15m
+unauthorized-confirm-after: 2m
+usage-recheck-delay: 12s
 notify-recovery: false
 notify-disabled: true
 notify-removed: true
@@ -56,7 +58,7 @@ max-concurrent-checks: 8
 	if strings.Join(cfg.Providers, ",") != "claude,codex" {
 		t.Fatalf("normalized providers = %v", cfg.Providers)
 	}
-	if cfg.ScanInterval != 2*time.Minute || cfg.StartupGrace != 5*time.Second || cfg.HTTPTimeout != 7*time.Second {
+	if cfg.ScanInterval != 2*time.Minute || cfg.StartupGrace != 5*time.Second || cfg.HTTPTimeout != 7*time.Second || cfg.UnauthorizedConfirmAfter != 2*time.Minute || cfg.UsageRecheckDelay != 12*time.Second {
 		t.Fatalf("durations not parsed: %+v", cfg)
 	}
 	if cfg.NotifyRecovery || !cfg.NotifyDisabled || !cfg.NotifyRemoved || cfg.ReminderInterval != 0 {
@@ -80,6 +82,10 @@ func TestParseRejectsUnsafeOrInvalidValues(t *testing.T) {
 		{"embedded URL credentials", "management-url: https://user:pass@example.com"},
 		{"too many workers", "max-concurrent-checks: 99"},
 		{"negative workers", "max-concurrent-checks: -5"},
+		{"zero usage recheck delay", "usage-recheck-delay: 0s"},
+		{"too short usage recheck delay", "usage-recheck-delay: 999ms"},
+		{"usage recheck exceeds scan", "scan-interval: 5s\nusage-recheck-delay: 6s"},
+		{"zero unauthorized confirmation", "unauthorized-confirm-after: 0s"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := Parse([]byte(test.raw)); err == nil {
