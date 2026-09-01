@@ -1,0 +1,38 @@
+plugins:
+  enabled: true
+  dir: "plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/NoorChasib/cpa-plugin-account-health-pushover/main/registry.json"
+  configs:
+    account-health-pushover:
+      enabled: true
+      priority: 20 # CPA plugin load/order priority; never an OAuth credential priority.
+
+      providers:
+        - claude
+        - codex
+
+      scan-interval: 1m
+      startup-grace: 30s
+      transient-confirm-after: 10m
+
+      notify-recovery: true
+      notify-disabled: false
+      notify-removed: false
+      reminder-interval: 12h
+      notification-coalesce-window: 5s
+      removed-state-retention: 168h
+
+      failure-notification-priority: 1
+      recovery-notification-priority: 0
+
+      pushover-app-token-env: CPA_PUSHOVER_APP_TOKEN
+      pushover-user-key-env: CPA_PUSHOVER_USER_KEY
+      pushover-app-token-file: ""
+      pushover-user-key-file: ""
+      pushover-device: ""
+
+      management-url: ""
+      state-file: "" # Defaults to <detected CPA auth dir>/.plugin-state/account-health-pushover/state.json.
+      pushover-http-timeout: 10s
+      max-concurrent-checks: 4

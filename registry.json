@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "account-health-pushover",
+      "name": "Account Health Pushover",
+      "description": "Sends Pushover alerts when Claude or Codex OAuth credentials require reauthentication or become credential-unhealthy.",
+      "author": "NoorChasib",
+      "repository": "https://github.com/NoorChasib/cpa-plugin-account-health-pushover",
+      "homepage": "https://github.com/NoorChasib/cpa-plugin-account-health-pushover",
+      "license": "MIT",
+      "tags": [
+        "monitoring",
+        "pushover",
+        "oauth",
+        "claude",
+        "codex"
+      ]
+    }
+  ]
+}

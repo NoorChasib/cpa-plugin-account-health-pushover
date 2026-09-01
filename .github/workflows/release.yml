@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: make fmt-check
+      - run: make vet
+      - run: make test-race
+      - run: make build
+      - run: make smoke
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            extension: so
+            cc: gcc
+          - name: linux-arm64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            extension: so
+            cc: aarch64-linux-gnu-gcc
+          - name: darwin-amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            extension: dylib
+            cc: clang
+          - name: darwin-arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+            extension: dylib
+            cc: clang
+          - name: windows-amd64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+            extension: dll
+            cc: gcc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Install Linux ARM64 cross compiler
+        if: matrix.name == 'linux-arm64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Derive and validate version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.1.0"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid release version: $VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Build c-shared library
+        shell: bash
+        run: |
+          mkdir -p dist
+          export CGO_ENABLED=1 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}'
+          export CC='${{ matrix.cc }}'
+          go build -trimpath -buildmode=c-shared \
+            -ldflags "-X github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/plugin.Version=${VERSION}" \
+            -o 'dist/account-health-pushover.${{ matrix.extension }}' .
+          rm -f dist/account-health-pushover.h
+      - name: Package release archive
+        shell: bash
+        run: |
+          python3 scripts/package-release.py \
+            --library 'dist/account-health-pushover.${{ matrix.extension }}' \
+            --archive "dist/account-health-pushover_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" \
+            --entry 'account-health-pushover.${{ matrix.extension }}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums.txt
+        run: sort dist/*.sha256 > dist/checksums.txt
+      - name: Verify release bundle
+        run: ./scripts/verify-release.sh dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --verify-tag --generate-notes
