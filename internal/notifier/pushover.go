@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -212,13 +213,21 @@ type Job struct {
 	Callback func(DeliveryResult)
 }
 
+// defaultStopTimeout bounds how long Stop waits for the delivery worker to
+// exit after cancellation. Cancellation aborts in-flight HTTP requests and
+// retry backoffs almost immediately, so this bound only matters when a
+// delivery ignores cancellation; the worker is then safely abandoned.
+const defaultStopTimeout = 5 * time.Second
+
 type Dispatcher struct {
 	client         *Client
 	queue          chan Job
 	coalesceWindow time.Duration
-	stop           chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
 	done           chan struct{}
-	stopOnce       sync.Once
+	stopTimeout    time.Duration
+	started        atomic.Bool
 
 	mu      sync.Mutex
 	dropped uint64
@@ -228,22 +237,42 @@ func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) 
 	if queueSize < 1 {
 		queueSize = 64
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Dispatcher{
 		client:         client,
 		queue:          make(chan Job, queueSize),
 		coalesceWindow: coalesceWindow,
-		stop:           make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
 		done:           make(chan struct{}),
+		stopTimeout:    defaultStopTimeout,
 	}
 }
 
 func (d *Dispatcher) Start() {
+	if !d.started.CompareAndSwap(false, true) {
+		return
+	}
 	go d.run()
 }
 
+// Stop cancels any in-flight delivery (aborting the HTTP request or retry
+// backoff) and waits for the delivery worker to exit. The wait is hard-bounded
+// by stopTimeout so host lifecycle calls (quiesce, reconfigure, shutdown) can
+// never hang behind a stuck delivery: a worker that does not exit in time is
+// safely abandoned — it holds no locks Stop's caller needs, cannot start new
+// deliveries, and exits on its own once its blocking call returns.
 func (d *Dispatcher) Stop() {
-	d.stopOnce.Do(func() { close(d.stop) })
-	<-d.done
+	d.cancel()
+	if !d.started.Load() {
+		return
+	}
+	timer := time.NewTimer(d.stopTimeout)
+	defer timer.Stop()
+	select {
+	case <-d.done:
+	case <-timer.C:
+	}
 }
 
 func (d *Dispatcher) Enqueue(job Job) bool {
@@ -264,46 +293,52 @@ func (d *Dispatcher) run() {
 	defer close(d.done)
 	for {
 		select {
-		case <-d.stop:
+		case <-d.ctx.Done():
 			return
 		case first := <-d.queue:
-			batch := []Job{first}
-			if d.coalesceWindow > 0 {
-				timer := time.NewTimer(d.coalesceWindow)
-			collect:
-				for {
-					select {
-					case job := <-d.queue:
-						batch = append(batch, job)
-						if len(batch) >= 32 {
-							break collect
-						}
-					case <-timer.C:
-						break collect
-					case <-d.stop:
-						if !timer.Stop() {
-							select {
-							case <-timer.C:
-							default:
-							}
-						}
-						return
-					}
-				}
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
+			batch, ok := d.collect(first)
+			if !ok {
+				return
 			}
 			d.updateQueueStatus()
-			d.deliverBatch(batch)
+			d.deliverBatch(d.ctx, batch)
+			if d.ctx.Err() != nil {
+				return
+			}
 		}
 	}
 }
 
-func (d *Dispatcher) deliverBatch(batch []Job) {
+// collect gathers jobs that arrive within the coalesce window. It reports
+// false when the dispatcher was stopped while collecting; the batch is then
+// abandoned undelivered.
+func (d *Dispatcher) collect(first Job) ([]Job, bool) {
+	batch := []Job{first}
+	if d.coalesceWindow <= 0 {
+		return batch, true
+	}
+	timer := time.NewTimer(d.coalesceWindow)
+	defer timer.Stop()
+	for {
+		select {
+		case job := <-d.queue:
+			batch = append(batch, job)
+			if len(batch) >= 32 {
+				return batch, true
+			}
+		case <-timer.C:
+			return batch, true
+		case <-d.ctx.Done():
+			return nil, false
+		}
+	}
+}
+
+// deliverBatch sends each coalesced group with a delivery context derived from
+// parent, so stopping the dispatcher cancels the in-flight HTTP request or
+// retry backoff. The interrupted group's callbacks still receive the final
+// (canceled) result; groups not yet started are abandoned.
+func (d *Dispatcher) deliverBatch(parent context.Context, batch []Job) {
 	groups := make(map[string][]Job)
 	order := make([]string, 0)
 	for _, job := range batch {
@@ -317,6 +352,9 @@ func (d *Dispatcher) deliverBatch(batch []Job) {
 		groups[key] = append(groups[key], job)
 	}
 	for _, key := range order {
+		if parent.Err() != nil {
+			return
+		}
 		jobs := groups[key]
 		stillValid := jobs[:0]
 		for _, job := range jobs {
@@ -332,7 +370,7 @@ func (d *Dispatcher) deliverBatch(batch []Job) {
 		if len(jobs) > 1 {
 			message = coalescedMessage(jobs)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), d.client.DeliveryTimeout())
+		ctx, cancel := context.WithTimeout(parent, d.client.DeliveryTimeout())
 		result := d.client.Send(ctx, message)
 		cancel()
 		for _, job := range jobs {

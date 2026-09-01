@@ -20,6 +20,12 @@ import (
 
 const notificationRetryAfter = 5 * time.Minute
 
+// stopWaitBound caps how long Stop waits for the reconcile loop to exit after
+// cancellation, so host lifecycle calls (quiesce, reconfigure, shutdown)
+// return within a hard bounded deadline even if a host callback ignores
+// context cancellation.
+const stopWaitBound = 5 * time.Second
+
 type Host interface {
 	ListAuth(context.Context) ([]protocol.HostAuthFileEntry, error)
 	GetRuntime(context.Context, string) (protocol.HostAuthFileEntry, error)
@@ -112,9 +118,25 @@ func (m *Monitor) Start() {
 	go m.loop()
 }
 
+// Stop cancels monitoring and notification delivery. Both waits are bounded:
+// the reconcile loop is abandoned after stopWaitBound if it is stuck inside a
+// host callback that ignored cancellation, and the dispatcher's Stop bounds
+// its own wait. An abandoned goroutine holds no locks Stop's caller needs and
+// exits on its own once its blocking call returns; state writes stay safe
+// because persistence is an atomic rename.
 func (m *Monitor) Stop() {
 	m.cancel()
-	m.wg.Wait()
+	loopDone := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(loopDone)
+	}()
+	timer := time.NewTimer(stopWaitBound)
+	defer timer.Stop()
+	select {
+	case <-loopDone:
+	case <-timer.C:
+	}
 	m.dispatcher.Stop()
 }
 

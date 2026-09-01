@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -126,6 +127,10 @@ func TestPushover429DoesNotBlindlyRetry(t *testing.T) {
 	if calls.Load() != 1 || !strings.Contains(result.Error, "quota") {
 		t.Fatalf("result=%+v calls=%d", result, calls.Load())
 	}
+	snapshot := client.Snapshot()
+	if !strings.Contains(snapshot.LastError, "quota") || !snapshot.LastSuccessfulSend.IsZero() {
+		t.Fatalf("snapshot does not report the 429 delivery as unhealthy: %+v", snapshot)
+	}
 }
 
 func TestPushover500RetriesAtMostThreeAttempts(t *testing.T) {
@@ -198,7 +203,6 @@ func TestPushoverMessageLengthsAreBounded(t *testing.T) {
 func TestDispatcherQueueIsBoundedAndNonBlocking(t *testing.T) {
 	cfg := configuredTestConfig(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(50 * time.Millisecond)
 		_, _ = io.WriteString(w, `{"status":1}`)
 	}))
 	defer server.Close()
@@ -230,22 +234,41 @@ func TestDispatcherDropsInvalidJobBeforeSend(t *testing.T) {
 	dispatcher := NewDispatcher(client, 4, 10*time.Millisecond)
 	dispatcher.Start()
 	defer dispatcher.Stop()
-	callbackCalled := make(chan struct{}, 1)
+	invalidCallback := make(chan struct{}, 1)
 	if !dispatcher.Enqueue(Job{
-		Message: Message{Body: "stale"},
+		Message: Message{Kind: "stale", Body: "stale"},
 		Valid:   func() bool { return false },
 		Callback: func(DeliveryResult) {
-			callbackCalled <- struct{}{}
+			invalidCallback <- struct{}{}
 		},
 	}) {
 		t.Fatal("could not enqueue test job")
 	}
-	time.Sleep(50 * time.Millisecond)
-	if calls.Load() != 0 {
-		t.Fatalf("invalid job reached Pushover %d times", calls.Load())
+	// The sentinel uses a different kind, so if the invalid job were sent it
+	// would form its own, earlier group; the sentinel callback therefore only
+	// fires after every send the invalid job could have caused.
+	sentinelDone := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{
+		Message: Message{Kind: "sentinel", Body: "sentinel"},
+		Callback: func(result DeliveryResult) {
+			sentinelDone <- result
+		},
+	}) {
+		t.Fatal("could not enqueue sentinel job")
 	}
 	select {
-	case <-callbackCalled:
+	case result := <-sentinelDone:
+		if !result.Accepted {
+			t.Fatalf("sentinel delivery failed: %+v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for sentinel delivery")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected only the sentinel send, Pushover was called %d times", calls.Load())
+	}
+	select {
+	case <-invalidCallback:
 		t.Fatal("invalid job callback was invoked")
 	default:
 	}
@@ -300,5 +323,184 @@ func TestDispatcherCoalescesSameKindAndPriority(t *testing.T) {
 	}
 	if calls.Load() != 1 || receivedTitle != "CLIProxyAPI: multiple account health alerts" || !strings.Contains(receivedBody, "2 account transitions") {
 		t.Fatalf("calls=%d title=%q body=%q", calls.Load(), receivedTitle, receivedBody)
+	}
+}
+
+func TestDispatcherStopCancelsInFlightHTTPDelivery(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	requestStarted := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Consume the body so the server arms client-disconnect detection.
+		_, _ = io.Copy(io.Discard, r.Body)
+		startedOnce.Do(func() { close(requestStarted) })
+		// Never respond; the canceled client's disconnect ends the request.
+		// The release channel is a failsafe so server.Close can never hang.
+		select {
+		case <-r.Context().Done():
+		case <-handlerRelease:
+		}
+	}))
+	defer server.Close()
+	defer close(handlerRelease)
+	// No client timeout: cancellation via Stop must be what aborts the request.
+	client := NewClient(cfg, server.URL, &http.Client{})
+	dispatcher := NewDispatcher(client, 4, 0)
+	dispatcher.Start()
+	delivered := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{
+		Message:  Message{Body: "in-flight"},
+		Callback: func(result DeliveryResult) { delivered <- result },
+	}) {
+		t.Fatal("could not enqueue test job")
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery request never reached the test server")
+	}
+	stopReturned := make(chan struct{})
+	go func() {
+		dispatcher.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return while an HTTP request was in flight")
+	}
+	select {
+	case result := <-delivered:
+		if result.Accepted || result.Error == "" {
+			t.Fatalf("canceled in-flight delivery reported success: %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight job callback was not invoked after cancellation")
+	}
+	select {
+	case <-dispatcher.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatcher worker did not exit after cancellation")
+	}
+}
+
+func TestDispatcherStopCancelsRetryBackoff(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"status":0}`)
+	}))
+	defer server.Close()
+	client := NewClient(cfg, server.URL, server.Client())
+	sleeping := make(chan struct{})
+	var sleepOnce sync.Once
+	client.sleep = func(ctx context.Context, _ time.Duration) error {
+		sleepOnce.Do(func() { close(sleeping) })
+		// Only cancellation can end the backoff; a missed cancel hangs here.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	dispatcher := NewDispatcher(client, 4, 0)
+	dispatcher.Start()
+	delivered := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{
+		Message:  Message{Body: "retrying"},
+		Callback: func(result DeliveryResult) { delivered <- result },
+	}) {
+		t.Fatal("could not enqueue test job")
+	}
+	select {
+	case <-sleeping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery never entered its retry backoff")
+	}
+	stopReturned := make(chan struct{})
+	go func() {
+		dispatcher.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return while a retry backoff was in progress")
+	}
+	select {
+	case result := <-delivered:
+		if result.Accepted || !strings.Contains(result.Error, "canceled") {
+			t.Fatalf("canceled backoff did not surface as canceled: %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job callback was not invoked after backoff cancellation")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("delivery retried after cancellation: calls=%d", calls.Load())
+	}
+}
+
+func TestDispatcherStopIsBoundedWhenDeliveryIgnoresCancellation(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	transport := &failingRoundTripper{}
+	client := NewClient(cfg, ProductionEndpoint, &http.Client{Transport: transport})
+	sleeping := make(chan struct{})
+	stuck := make(chan struct{})
+	var sleepOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(stuck) }) }
+	defer release()
+	client.sleep = func(context.Context, time.Duration) error {
+		sleepOnce.Do(func() { close(sleeping) })
+		// Deliberately ignore cancellation to simulate a stuck delivery.
+		<-stuck
+		return nil
+	}
+	dispatcher := NewDispatcher(client, 4, 0)
+	dispatcher.stopTimeout = 50 * time.Millisecond
+	dispatcher.Start()
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "stuck"}}) {
+		t.Fatal("could not enqueue test job")
+	}
+	select {
+	case <-sleeping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery never got stuck in its backoff")
+	}
+	stopReturned := make(chan struct{})
+	go func() {
+		dispatcher.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bounded Stop hung behind a delivery that ignores cancellation")
+	}
+	select {
+	case <-dispatcher.done:
+		t.Fatal("worker exited while still stuck; Stop should have abandoned it")
+	default:
+	}
+	release()
+	select {
+	case <-dispatcher.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("abandoned worker did not exit once its blocking call returned")
+	}
+}
+
+func TestDispatcherStopWithoutStartReturnsImmediately(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, 0)
+	stopReturned := make(chan struct{})
+	go func() {
+		dispatcher.Stop()
+		close(stopReturned)
+	}()
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop blocked for a dispatcher that was never started")
 	}
 }
