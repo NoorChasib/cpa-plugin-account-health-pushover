@@ -40,6 +40,10 @@ static void store_host_api(const cliproxy_host_api* host) {
 	stored_host = host;
 }
 
+static void clear_host_api(void) {
+	stored_host = NULL;
+}
+
 static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
 	if (stored_host == NULL || stored_host->call == NULL) {
 		return 1;
@@ -73,18 +77,57 @@ import (
 
 var (
 	allowTestEndpointOverride = "false"
+	nativeLifecycleMu         sync.Mutex
 	globalMu                  sync.RWMutex
 	globalPlugin              *pluginimpl.Plugin
+	hostCalls                 hostCallGate
+	clearStoredHostAPI        = func() { C.clear_host_api() }
 )
+
+type hostCallGate struct {
+	mu       sync.Mutex
+	stopping bool
+	calls    sync.WaitGroup
+}
+
+func (g *hostCallGate) reset() {
+	g.mu.Lock()
+	g.stopping = false
+	g.mu.Unlock()
+}
+
+func (g *hostCallGate) begin() (func(), bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopping {
+		return nil, false
+	}
+	g.calls.Add(1)
+	var once sync.Once
+	return func() { once.Do(g.calls.Done) }, true
+}
+
+func (g *hostCallGate) stopAccepting() {
+	g.mu.Lock()
+	g.stopping = true
+	g.mu.Unlock()
+}
+
+func (g *hostCallGate) wait() {
+	g.calls.Wait()
+}
 
 type hostBridge struct{}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, api *C.cliproxy_plugin_api) C.int {
+	nativeLifecycleMu.Lock()
+	defer nativeLifecycleMu.Unlock()
 	if host == nil || api == nil {
 		return 1
 	}
 	C.store_host_api(host)
+	hostCalls.reset()
 	api.abi_version = C.uint32_t(protocol.ABIVersion)
 	api.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	api.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -144,13 +187,24 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	nativeLifecycleMu.Lock()
+	defer nativeLifecycleMu.Unlock()
 	globalMu.Lock()
 	current := globalPlugin
 	globalPlugin = nil
 	globalMu.Unlock()
+
+	// Close native host-call admission before stopping the Go plugin. Monitor
+	// shutdown drains every reconciliation that was already admitted, and the
+	// gate below additionally covers any host call outside monitor lifecycle
+	// accounting. The host API pointer is cleared only after all callbacks have
+	// returned, so CPA may safely free its table and unload the shared object.
+	hostCalls.stopAccepting()
 	if current != nil {
 		current.Shutdown()
 	}
+	hostCalls.wait()
+	clearStoredHostAPI()
 }
 
 func (hostBridge) ListAuth(ctx context.Context) ([]protocol.HostAuthFileEntry, error) {
@@ -186,6 +240,12 @@ func (hostBridge) Log(ctx context.Context, level, message string, fields map[str
 }
 
 func callHost(ctx context.Context, method string, payload any) (json.RawMessage, error) {
+	finish, accepted := hostCalls.begin()
+	if !accepted {
+		return nil, errors.New("host callbacks are shutting down")
+	}
+	defer finish()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

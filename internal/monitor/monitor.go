@@ -21,13 +21,9 @@ import (
 const (
 	notificationRetryAfter = 5 * time.Minute
 	failureEvidenceTTL     = 2 * time.Minute
+	notificationDrainMin   = 5 * time.Second
+	notificationDrainMax   = time.Minute
 )
-
-// stopWaitBound caps how long Stop waits for the reconcile loop to exit after
-// cancellation, so host lifecycle calls (quiesce, reconfigure, shutdown)
-// return within a hard bounded deadline even if a host callback ignores
-// context cancellation.
-const stopWaitBound = 5 * time.Second
 
 type Host interface {
 	ListAuth(context.Context) ([]protocol.HostAuthFileEntry, error)
@@ -82,13 +78,17 @@ type Monitor struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	loopWG sync.WaitGroup
+
+	lifecycleMu sync.Mutex
+	operations  sync.WaitGroup
+	stopping    bool
+	stopOnce    sync.Once
 
 	signals   chan struct{}
 	pendingMu sync.Mutex
 	pending   map[string]struct{}
 	evidence  map[string]health.FailureEvidence
-	aliases   map[string]string
 }
 
 func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *notifier.Dispatcher) *Monitor {
@@ -110,43 +110,61 @@ func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *noti
 		signals:  make(chan struct{}, 1),
 		pending:  make(map[string]struct{}),
 		evidence: make(map[string]health.FailureEvidence),
-		aliases:  make(map[string]string),
 	}
 }
 
 func (m *Monitor) Start() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.stopping {
+		return
+	}
 	m.dispatcher.Start()
 	if !m.cfg.Enabled {
 		return
 	}
-	m.wg.Add(1)
+	m.loopWG.Add(1)
 	go m.loop()
 }
 
-// Stop cancels monitoring and notification delivery. Both waits are bounded:
-// the reconcile loop is abandoned after stopWaitBound if it is stuck inside a
-// host callback that ignored cancellation, and the dispatcher's Stop bounds
-// its own wait. An abandoned goroutine holds no locks Stop's caller needs and
-// exits on its own once its blocking call returns; state writes stay safe
-// because persistence is an atomic rename.
+// Stop closes reconciliation admission before waiting, so WaitGroup.Add can
+// never race with Wait. Every admitted reconciliation is allowed to return,
+// even when a host callback ignores context cancellation; only then is the
+// bounded, cancellation-aware notification dispatcher stopped.
 func (m *Monitor) Stop() {
-	m.cancel()
-	loopDone := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(loopDone)
-	}()
-	timer := time.NewTimer(stopWaitBound)
-	defer timer.Stop()
-	select {
-	case <-loopDone:
-	case <-timer.C:
+	m.stopOnce.Do(func() {
+		m.lifecycleMu.Lock()
+		m.stopping = true
+		m.cancel()
+		m.lifecycleMu.Unlock()
+
+		m.loopWG.Wait()
+		m.operations.Wait()
+
+		// Stop accepting notification work and flush any coalescing delay before
+		// giving already-accepted jobs a bounded opportunity to finish. This keeps
+		// reconfigure from spending the drain budget on the coalescing window and
+		// then canceling the actual delivery.
+		m.dispatcher.BeginDrain()
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), m.notificationDrainTimeout())
+		m.dispatcher.WaitIdle(drainCtx)
+		cancelDrain()
+		m.dispatcher.Stop()
+	})
+}
+
+func (m *Monitor) beginOperation() bool {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.stopping {
+		return false
 	}
-	m.dispatcher.Stop()
+	m.operations.Add(1)
+	return true
 }
 
 func (m *Monitor) loop() {
-	defer m.wg.Done()
+	defer m.loopWG.Done()
 	startup := time.NewTimer(m.cfg.StartupGrace)
 	defer startup.Stop()
 	select {
@@ -259,6 +277,11 @@ func (m *Monitor) pruneFailureEvidence(candidates []protocol.HostAuthFileEntry, 
 }
 
 func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
+	if !m.beginOperation() {
+		return context.Canceled
+	}
+	defer m.operations.Done()
+
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	now := m.now().UTC()
@@ -318,17 +341,39 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 	wg.Wait()
 	close(results)
 
+	items := make([]result, 0, len(candidates))
+	for item := range results {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return health.AccountKey(items[i].entry.Provider, items[i].entry.AuthIndex) < health.AccountKey(items[j].entry.Provider, items[j].entry.AuthIndex)
+	})
+
 	activeKeys := make(map[string]struct{}, len(candidates))
+	identityCounts := make(map[string]int, len(candidates))
 	for _, candidate := range candidates {
 		activeKeys[health.AccountKey(candidate.Provider, candidate.AuthIndex)] = struct{}{}
+		if identity := health.IdentityFingerprint(candidate); identity != "" {
+			identityCounts[candidate.Provider+"\x00"+identity]++
+		}
 	}
+	m.correlateReplacementCandidates(candidates, identityCounts)
+
 	partialFailure := false
-	for item := range results {
+	failedEntries := make([]protocol.HostAuthFileEntry, 0)
+	for _, item := range items {
 		if item.err != nil {
 			partialFailure = true
+			failedEntries = append(failedEntries, item.entry)
 			continue
 		}
 		m.applyObservation(item.snapshot, item.observation, activeKeys, now)
+	}
+	for _, entry := range failedEntries {
+		identity := health.IdentityFingerprint(entry)
+		if identity != "" && identityCounts[entry.Provider+"\x00"+identity] == 1 {
+			m.preserveReplacementCandidate(entry, activeKeys)
+		}
 	}
 	m.markRemoved(activeKeys, now)
 
@@ -358,6 +403,17 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 func (m *Monitor) CheckNow(ctx context.Context) Status {
 	_ = m.Reconcile(ctx, "management")
 	return m.Snapshot()
+}
+
+func (m *Monitor) notificationDrainTimeout() time.Duration {
+	timeout := m.client.DeliveryTimeout()
+	if timeout < notificationDrainMin {
+		return notificationDrainMin
+	}
+	if timeout > notificationDrainMax {
+		return notificationDrainMax
+	}
+	return timeout
 }
 
 func (m *Monitor) NotificationTimeout() time.Duration {
@@ -420,10 +476,15 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 	account := m.data.Accounts[snapshot.AuthKey]
+	if account != nil && account.Identity != "" && snapshot.Identity != "" && account.Identity != snapshot.Identity {
+		// An auth index can be reused after replacement. Without a safe identity
+		// correlation, the new credential must not inherit the prior logical
+		// account's incident generation, delivery state, or recovery state.
+		account = nil
+	}
 	if account == nil {
 		if oldKey := m.correlatedKeyLocked(snapshot, activeKeys); oldKey != "" {
 			account = m.data.Accounts[oldKey]
-			m.setAliasLocked(oldKey, snapshot.AuthKey)
 			delete(m.data.Accounts, oldKey)
 			account.AccountKey = snapshot.AuthKey
 			account.AuthIndex = snapshot.AuthIndex
@@ -543,6 +604,113 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 	}
 }
 
+func (m *Monitor) correlateReplacementCandidates(candidates []protocol.HostAuthFileEntry, identityCounts map[string]int) {
+	type replacementMove struct {
+		oldKey    string
+		newKey    string
+		authIndex string
+		account   *state.Account
+	}
+
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	moves := make([]replacementMove, 0)
+	for _, candidate := range candidates {
+		identity := health.IdentityFingerprint(candidate)
+		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
+		if identity == "" || identityCounts[candidate.Provider+"\x00"+identity] != 1 {
+			continue
+		}
+		newKey := health.AccountKey(provider, candidate.AuthIndex)
+		if current := m.data.Accounts[newKey]; current != nil && current.Provider == provider && current.Identity == identity {
+			continue
+		}
+
+		oldKey := ""
+		var matched *state.Account
+		for key, account := range m.data.Accounts {
+			if key == newKey || account == nil || account.Provider != provider || account.Identity != identity {
+				continue
+			}
+			if matched != nil {
+				matched = nil
+				oldKey = ""
+				break
+			}
+			oldKey = key
+			matched = account
+		}
+		if matched != nil {
+			moves = append(moves, replacementMove{oldKey: oldKey, newKey: newKey, authIndex: strings.TrimSpace(candidate.AuthIndex), account: matched})
+		}
+	}
+	if len(moves) == 0 {
+		return
+	}
+
+	validBySource := make(map[string]replacementMove, len(moves))
+	for _, move := range moves {
+		validBySource[move.oldKey] = move
+	}
+	for changed := true; changed; {
+		changed = false
+		for source, move := range validBySource {
+			if occupant := m.data.Accounts[move.newKey]; occupant != nil {
+				if _, moving := validBySource[move.newKey]; !moving {
+					delete(validBySource, source)
+					changed = true
+				}
+			}
+		}
+	}
+	valid := make([]replacementMove, 0, len(validBySource))
+	for _, move := range moves {
+		if _, ok := validBySource[move.oldKey]; ok {
+			valid = append(valid, move)
+		}
+	}
+	for _, move := range valid {
+		delete(m.data.Accounts, move.oldKey)
+	}
+	for _, move := range valid {
+		move.account.AccountKey = move.newKey
+		move.account.AuthIndex = move.authIndex
+		move.account.RemovedAt = time.Time{}
+		m.data.Accounts[move.newKey] = move.account
+	}
+}
+
+func (m *Monitor) preserveReplacementCandidate(candidate protocol.HostAuthFileEntry, activeKeys map[string]struct{}) {
+	identity := health.IdentityFingerprint(candidate)
+	if identity == "" {
+		return
+	}
+	candidateKey := health.AccountKey(candidate.Provider, candidate.AuthIndex)
+	match := ""
+	m.stateMu.RLock()
+	for key, account := range m.data.Accounts {
+		if key == candidateKey || account == nil || account.Provider != candidate.Provider || account.Identity != identity {
+			continue
+		}
+		if _, active := activeKeys[key]; active {
+			continue
+		}
+		if match != "" {
+			match = ""
+			break
+		}
+		match = key
+	}
+	m.stateMu.RUnlock()
+	if match != "" {
+		// A roster-visible replacement with an exact, unique safe identity keeps
+		// the old logical account active while its runtime read is temporarily
+		// unavailable. A later successful read can then correlate and recover it.
+		activeKeys[match] = struct{}{}
+	}
+}
+
 func (m *Monitor) correlatedKeyLocked(snapshot health.RuntimeSnapshot, activeKeys map[string]struct{}) string {
 	if snapshot.Identity == "" {
 		return ""
@@ -561,44 +729,6 @@ func (m *Monitor) correlatedKeyLocked(snapshot health.RuntimeSnapshot, activeKey
 		match = key
 	}
 	return match
-}
-
-func (m *Monitor) setAliasLocked(oldKey, newKey string) {
-	if oldKey == "" || newKey == "" || oldKey == newKey {
-		return
-	}
-	delete(m.aliases, newKey)
-	for key, target := range m.aliases {
-		if target == oldKey {
-			m.aliases[key] = newKey
-		}
-		if key == target {
-			delete(m.aliases, key)
-		}
-	}
-	m.aliases[oldKey] = newKey
-}
-
-func (m *Monitor) resolveAccountKeyLocked(accountKey string) string {
-	if _, exists := m.data.Accounts[accountKey]; exists || len(m.aliases) == 0 {
-		return accountKey
-	}
-	visited := make(map[string]struct{}, len(m.aliases)+1)
-	for hops := 0; hops <= len(m.aliases); hops++ {
-		if _, exists := m.data.Accounts[accountKey]; exists {
-			return accountKey
-		}
-		if _, seen := visited[accountKey]; seen {
-			break
-		}
-		visited[accountKey] = struct{}{}
-		next, exists := m.aliases[accountKey]
-		if !exists || next == "" || next == accountKey {
-			break
-		}
-		accountKey = next
-	}
-	return accountKey
 }
 
 func (m *Monitor) markRemoved(activeKeys map[string]struct{}, now time.Time) {
@@ -643,15 +773,17 @@ func (m *Monitor) enqueueFailureLocked(account *state.Account, reminder bool, no
 		kind = "reminder"
 	}
 	generation := account.IncidentGeneration
-	account.LastAlertAttemptAt = now
-	account.LastAlertAttemptGeneration = generation
-	m.enqueueLocked(account.AccountKey, kind, generation, m.failureMessage(account, kind, now))
+	if m.enqueueLocked(account, kind, generation, m.failureMessage(account, kind, now)) {
+		account.LastAlertAttemptAt = now
+		account.LastAlertAttemptGeneration = generation
+	}
 }
 
 func (m *Monitor) enqueueRecoveryLocked(account *state.Account, now time.Time) {
 	generation := account.IncidentGeneration
-	account.LastRecoveryAttemptAt = now
-	m.enqueueLocked(account.AccountKey, "recovery", generation, m.recoveryMessage(account, now))
+	if m.enqueueLocked(account, "recovery", generation, m.recoveryMessage(account, now)) {
+		account.LastRecoveryAttemptAt = now
+	}
 }
 
 func (m *Monitor) enqueueInformationalLocked(account *state.Account, kind string) {
@@ -666,27 +798,39 @@ func (m *Monitor) enqueueInformationalLocked(account *state.Account, kind string
 		Label:      account.Label,
 		Reason:     kind,
 	}
-	m.enqueueLocked(account.AccountKey, kind, account.IncidentGeneration, message)
+	m.enqueueLocked(account, kind, account.IncidentGeneration, message)
 }
 
-func (m *Monitor) enqueueLocked(accountKey, kind string, generation uint64, message notifier.Message) {
+func (m *Monitor) enqueueLocked(account *state.Account, kind string, generation uint64, message notifier.Message) bool {
 	job := notifier.Job{
 		Message:  message,
-		Valid:    m.deliveryValid(accountKey, kind, generation),
-		Callback: m.deliveryCallback(accountKey, kind, generation),
+		Valid:    m.deliveryValid(account, kind, generation),
+		Callback: m.deliveryCallback(account, kind, generation),
 	}
 	if !m.dispatcher.Enqueue(job) {
-		m.data.LastNotificationErr = "notification queue is full"
+		m.data.LastNotificationErr = "notification queue is unavailable"
+		return false
 	}
+	return true
 }
 
-func (m *Monitor) deliveryValid(accountKey, kind string, generation uint64) func() bool {
+func (m *Monitor) accountCurrentLocked(target *state.Account) bool {
+	if target == nil {
+		return false
+	}
+	for _, account := range m.data.Accounts {
+		if account == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Monitor) deliveryValid(account *state.Account, kind string, generation uint64) func() bool {
 	return func() bool {
 		m.stateMu.RLock()
 		defer m.stateMu.RUnlock()
-		resolved := m.resolveAccountKeyLocked(accountKey)
-		account := m.data.Accounts[resolved]
-		if account == nil {
+		if !m.accountCurrentLocked(account) {
 			return false
 		}
 		switch kind {
@@ -704,16 +848,15 @@ func (m *Monitor) deliveryValid(accountKey, kind string, generation uint64) func
 	}
 }
 
-func (m *Monitor) deliveryCallback(accountKey, kind string, generation uint64) func(notifier.DeliveryResult) {
+func (m *Monitor) deliveryCallback(account *state.Account, kind string, generation uint64) func(notifier.DeliveryResult) {
 	return func(result notifier.DeliveryResult) {
 		m.stateMu.Lock()
 		defer m.stateMu.Unlock()
-		accountKey = m.resolveAccountKeyLocked(accountKey)
-		account := m.data.Accounts[accountKey]
+		current := m.accountCurrentLocked(account)
 		if result.Accepted {
 			m.data.LastSuccessfulSend = result.At
 			m.data.LastNotificationErr = ""
-			if account != nil {
+			if current {
 				switch kind {
 				case "failure", "reminder":
 					if account.IncidentGeneration != generation {

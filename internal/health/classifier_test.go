@@ -93,6 +93,12 @@ func TestClassifierUsesProductionAvailableEvidence(t *testing.T) {
 			reason:   ReasonCooldownRecoveryUnconfirmed,
 		},
 		{
+			name:     "available residual model error is nonpromotable",
+			snapshot: runtimeSnapshot(now, "error", `{"model":"fable","residual":"quota"}`, false, time.Time{}, 0),
+			want:     Suspect,
+			reason:   ReasonAvailableResidualError,
+		},
+		{
 			name:      "ambiguous 403",
 			snapshot:  runtimeSnapshot(now, "error", "payment_required", true, now.Add(time.Minute), 403),
 			want:      Suspect,

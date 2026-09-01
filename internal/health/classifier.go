@@ -60,9 +60,19 @@ func (classifier) Classify(snapshot RuntimeSnapshot) Observation {
 		return observation
 	}
 
-	switch snapshot.MessageCode {
-	case RuntimeMessageQuotaExhausted:
+	if snapshot.MessageCode == RuntimeMessageQuotaExhausted {
 		return result(QuotaLimited, ReasonQuotaExhausted, "credential is authenticated but temporarily quota limited")
+	}
+
+	// CPA can retain a model-scoped error after a different model succeeds. If
+	// the auth remains available and there is no auth-level retry or structured
+	// request evidence, that residual status cannot establish account-wide
+	// credential failure and must never start a promotion clock.
+	if !snapshot.Unavailable && snapshot.NextRetryAfter.IsZero() {
+		return result(Suspect, ReasonAvailableResidualError, "credential remains available despite a residual runtime error")
+	}
+
+	switch snapshot.MessageCode {
 	case RuntimeMessageUnauthorized:
 		observation := result(Suspect, ReasonUnauthorizedRequest, "authorization failure is still inside CPA's retry window")
 		observation.Confirmation = ConfirmationUnauthorized

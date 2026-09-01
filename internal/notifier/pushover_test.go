@@ -3,6 +3,7 @@ package notifier
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -222,6 +223,66 @@ func TestDispatcherQueueIsBoundedAndNonBlocking(t *testing.T) {
 	}
 }
 
+func TestDispatcherRejectsEnqueueAfterStoppingStarts(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, 0)
+	dispatcher.Start()
+	dispatcher.Stop()
+
+	before := len(dispatcher.queue)
+	if dispatcher.Enqueue(Job{Message: Message{Body: "must not be queued"}}) {
+		t.Fatal("dispatcher accepted work after stopping started")
+	}
+	if after := len(dispatcher.queue); after != before {
+		t.Fatalf("stopped dispatcher queue length changed from %d to %d", before, after)
+	}
+}
+
+func TestDispatcherBeginDrainFlushesCoalescingAndRejectsNewWork(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	request := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		request <- struct{}{}
+		_, _ = io.WriteString(w, `{"status":1}`)
+	}))
+	defer server.Close()
+	client := NewClient(cfg, server.URL, server.Client())
+	dispatcher := NewDispatcher(client, 4, time.Hour)
+	dispatcher.Start()
+	defer dispatcher.Stop()
+
+	callback := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{
+		Message:  Message{Kind: "failure", Body: "accepted before drain"},
+		Callback: func(result DeliveryResult) { callback <- result },
+	}) {
+		t.Fatal("could not enqueue pre-drain job")
+	}
+	dispatcher.BeginDrain()
+	if dispatcher.Enqueue(Job{Message: Message{Body: "must be rejected"}}) {
+		t.Fatal("dispatcher accepted work after draining started")
+	}
+	select {
+	case <-request:
+	case <-time.After(time.Second):
+		t.Fatal("drain did not flush the active coalescing window")
+	}
+	select {
+	case result := <-callback:
+		if !result.Accepted {
+			t.Fatalf("pre-drain job was not delivered: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pre-drain job callback did not complete")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !dispatcher.WaitIdle(ctx) {
+		t.Fatal("dispatcher did not become idle after draining accepted work")
+	}
+}
+
 func TestDispatcherDropsInvalidJobBeforeSend(t *testing.T) {
 	cfg := configuredTestConfig(t)
 	var calls atomic.Int32
@@ -323,6 +384,174 @@ func TestDispatcherCoalescesSameKindAndPriority(t *testing.T) {
 	}
 	if calls.Load() != 1 || receivedTitle != "CLIProxyAPI: multiple account health alerts" || !strings.Contains(receivedBody, "2 account transitions") {
 		t.Fatalf("calls=%d title=%q body=%q", calls.Load(), receivedTitle, receivedBody)
+	}
+}
+
+func TestDispatcherSplitsOversizedCoalescedGroupsAndScopesCallbacks(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	var requestMu sync.Mutex
+	var bodies []string
+	var requestAccepted []bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		requestMu.Lock()
+		index := len(bodies)
+		body := r.PostForm.Get("message")
+		bodies = append(bodies, body)
+		accepted := index%2 == 0
+		requestAccepted = append(requestAccepted, accepted)
+		requestMu.Unlock()
+		if !accepted {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"status":0}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":1}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(cfg, server.URL, server.Client())
+	dispatcher := NewDispatcher(client, 64, 5*time.Second)
+	dispatcher.Start()
+	defer dispatcher.Stop()
+
+	const jobCount = 32
+	labels := make([]string, jobCount)
+	results := make([]DeliveryResult, jobCount)
+	callbackCounts := make([]int, jobCount)
+	done := make(chan int, jobCount)
+	for i := 0; i < jobCount; i++ {
+		i := i
+		labels[i] = fmt.Sprintf("account-%02d-%s", i, strings.Repeat("x", 56))
+		if !dispatcher.Enqueue(Job{
+			Message: Message{
+				Kind:     "failure",
+				Priority: 1,
+				Provider: "Claude",
+				Label:    labels[i],
+				Reason:   "persistent_unauthorized_request",
+			},
+			Callback: func(result DeliveryResult) {
+				results[i] = result
+				callbackCounts[i]++
+				done <- i
+			},
+		}) {
+			t.Fatalf("could not enqueue job %d", i)
+		}
+	}
+	for range jobCount {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for split-batch callbacks")
+		}
+	}
+
+	requestMu.Lock()
+	gotBodies := append([]string(nil), bodies...)
+	gotAccepted := append([]bool(nil), requestAccepted...)
+	requestMu.Unlock()
+	if len(gotBodies) < 2 {
+		t.Fatalf("oversized group used %d request; want multiple", len(gotBodies))
+	}
+	for requestIndex, body := range gotBodies {
+		if len([]rune(body)) > 1024 {
+			t.Fatalf("request %d has %d runes", requestIndex, len([]rune(body)))
+		}
+	}
+	for i, label := range labels {
+		includedIn := -1
+		for requestIndex, body := range gotBodies {
+			if strings.Contains(body, label) {
+				if includedIn >= 0 {
+					t.Fatalf("job %d appeared in multiple requests", i)
+				}
+				includedIn = requestIndex
+			}
+		}
+		if includedIn < 0 {
+			t.Fatalf("job %d, including the final account, was omitted from all requests", i)
+		}
+		if callbackCounts[i] != 1 {
+			t.Fatalf("job %d callback count=%d, want exactly one", i, callbackCounts[i])
+		}
+		if results[i].Accepted != gotAccepted[includedIn] {
+			t.Fatalf("job %d callback accepted=%v, request %d accepted=%v", i, results[i].Accepted, includedIn, gotAccepted[includedIn])
+		}
+	}
+}
+
+func TestDispatcherRevalidatesEachSplitGroupBeforeSending(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	var requestMu sync.Mutex
+	var bodies []string
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		requestMu.Lock()
+		requestIndex := len(bodies)
+		bodies = append(bodies, r.PostForm.Get("message"))
+		requestMu.Unlock()
+		if requestIndex == 0 {
+			firstOnce.Do(func() { close(firstStarted) })
+			<-releaseFirst
+		}
+		_, _ = io.WriteString(w, `{"status":1}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(cfg, server.URL, server.Client())
+	dispatcher := NewDispatcher(client, 64, time.Hour)
+	dispatcher.Start()
+	defer dispatcher.Stop()
+
+	const jobCount = 32
+	labels := make([]string, jobCount)
+	valid := make([]atomic.Bool, jobCount)
+	callbacks := make([]atomic.Int32, jobCount)
+	for i := 0; i < jobCount; i++ {
+		i := i
+		labels[i] = fmt.Sprintf("account-%02d-%s", i, strings.Repeat("x", 100))
+		valid[i].Store(true)
+		if !dispatcher.Enqueue(Job{
+			Message: Message{Kind: "failure", Priority: 1, Provider: "Claude", Label: labels[i], Reason: strings.Repeat("r", 80)},
+			Valid:   func() bool { return valid[i].Load() },
+			Callback: func(DeliveryResult) {
+				callbacks[i].Add(1)
+			},
+		}) {
+			t.Fatalf("could not enqueue job %d", i)
+		}
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first split request did not start")
+	}
+	valid[jobCount-1].Store(false)
+	close(releaseFirst)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !dispatcher.WaitIdle(ctx) {
+		t.Fatal("split delivery did not become idle")
+	}
+
+	requestMu.Lock()
+	gotBodies := append([]string(nil), bodies...)
+	requestMu.Unlock()
+	if len(gotBodies) < 2 {
+		t.Fatalf("test did not create multiple split requests: %d", len(gotBodies))
+	}
+	for _, body := range gotBodies {
+		if strings.Contains(body, labels[jobCount-1]) {
+			t.Fatal("job invalidated during an earlier split request was still sent")
+		}
+	}
+	if got := callbacks[jobCount-1].Load(); got != 0 {
+		t.Fatalf("invalidated split job callback count=%d, want zero", got)
 	}
 }
 

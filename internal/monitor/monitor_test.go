@@ -189,6 +189,77 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Fatal("condition was not met before timeout")
 }
 
+type blockingRuntimeHost struct {
+	entry   protocol.HostAuthFileEntry
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *blockingRuntimeHost) ListAuth(context.Context) ([]protocol.HostAuthFileEntry, error) {
+	return []protocol.HostAuthFileEntry{h.entry}, nil
+}
+
+func (h *blockingRuntimeHost) GetRuntime(context.Context, string) (protocol.HostAuthFileEntry, error) {
+	h.once.Do(func() { close(h.started) })
+	<-h.release
+	return h.entry, nil
+}
+
+func (*blockingRuntimeHost) Log(context.Context, string, string, map[string]any) {}
+
+func TestStopWaitsForBlockedHostCallback(t *testing.T) {
+	host := &blockingRuntimeHost{
+		entry:   oauthEntry("one", "claude", "a@example.com", "active", "", false),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	mock := newMockPushover(t)
+	cfg := config.Default()
+	cfg.StartupGrace = 24 * time.Hour
+	cfg.ScanInterval = 24 * time.Hour
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+	cfg.NotificationCoalesceWindow = 0
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
+	dispatcher := notifier.NewDispatcher(client, 4, 0)
+	monitor := New(cfg, host, client, dispatcher)
+	monitor.Start()
+
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- monitor.Reconcile(context.Background(), "blocked") }()
+	select {
+	case <-host.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime callback did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		monitor.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned while a host callback was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(host.release)
+	select {
+	case err := <-reconcileDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconciliation did not finish after releasing the host callback")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after the host callback completed")
+	}
+}
+
 func TestHealthyReauthDedupeAndRecovery(t *testing.T) {
 	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
 	mock := newMockPushover(t)
@@ -389,6 +460,34 @@ func TestFailedDeliveryRetriesLaterAndOnlyThenMarksAlert(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
 }
 
+func TestRejectedEnqueueDoesNotRecordNotificationAttempt(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	monitor.dispatcher.Stop()
+
+	if err := monitor.Reconcile(context.Background(), "dispatcher-stopped"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.stateMu.RLock()
+	account := monitor.data.Accounts["claude:one"]
+	lastError := monitor.data.LastNotificationErr
+	monitor.stateMu.RUnlock()
+	if account == nil {
+		t.Fatal("failure account was not created")
+	}
+	if !account.LastAlertAttemptAt.IsZero() || account.LastAlertAttemptGeneration != 0 {
+		t.Fatalf("rejected queue admission recorded a five-minute suppression attempt: %+v", account)
+	}
+	if lastError == "" {
+		t.Fatal("rejected queue admission was not surfaced in notifier state")
+	}
+	if mock.count() != 0 {
+		t.Fatalf("stopped dispatcher unexpectedly delivered %d notifications", mock.count())
+	}
+}
+
 func TestReminderOnlyAfterInterval(t *testing.T) {
 	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
 	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
@@ -438,6 +537,61 @@ func TestReplacementCorrelatesByExactEmailAndRecovers(t *testing.T) {
 	rows := monitor.Snapshot().Accounts
 	if len(rows) != 1 || rows[0].AuthIndex != "new-index" || rows[0].Health != health.Healthy {
 		t.Fatalf("replacement was not safely correlated: %+v", rows)
+	}
+}
+
+func TestReplacementRuntimeFailurePreservesIncidentUntilRecovery(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("old-index", "claude", "same@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	if err := monitor.Reconcile(context.Background(), "old-failure"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
+
+	monitor.stateMu.RLock()
+	old := monitor.data.Accounts["claude:old-index"]
+	generation := old.IncidentGeneration
+	alertAt := old.LastAlertAt
+	monitor.stateMu.RUnlock()
+
+	replacement := oauthEntry("new-index", "claude", "same@example.com", "active", "", false)
+	unrelated := oauthEntry("old-index", "claude", "other@example.com", "active", "", false)
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{replacement, unrelated}
+	host.runtime[replacement.AuthIndex] = replacement
+	host.runtime[unrelated.AuthIndex] = unrelated
+	host.runtimeErr[replacement.AuthIndex] = context.DeadlineExceeded
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "replacement-runtime-failed"); err == nil {
+		t.Fatal("expected temporary replacement runtime failure")
+	}
+	monitor.stateMu.RLock()
+	preserved := monitor.data.Accounts["claude:new-index"]
+	reused := monitor.data.Accounts["claude:old-index"]
+	monitor.stateMu.RUnlock()
+	if preserved == nil || preserved.Health != health.ReauthRequired || !preserved.AlertSent || preserved.IncidentGeneration != generation || !preserved.LastAlertAt.Equal(alertAt) {
+		t.Fatalf("temporary replacement read failure discarded incident state: %+v", preserved)
+	}
+	if reused == nil || reused.Health != health.Healthy || reused.AlertSent {
+		t.Fatalf("unrelated account reusing the old key inherited incident state: %+v", reused)
+	}
+
+	host.mu.Lock()
+	delete(host.runtimeErr, replacement.AuthIndex)
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "replacement-runtime-recovered"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 2 })
+	monitor.stateMu.RLock()
+	recovered := monitor.data.Accounts["claude:new-index"]
+	reused = monitor.data.Accounts["claude:old-index"]
+	monitor.stateMu.RUnlock()
+	if recovered == nil || recovered.Health != health.Healthy || reused == nil || reused.Health != health.Healthy || !strings.Contains(mock.all(), "account recovered") {
+		t.Fatalf("replacement recovery did not preserve and close the incident: recovered=%+v reused=%+v messages=%s", recovered, reused, mock.all())
 	}
 }
 
@@ -493,7 +647,7 @@ func TestUsageSignalIsNonBlockingAndBurstCoalesced(t *testing.T) {
 	}
 }
 
-func TestRepeatedReplacementCorrelationCannotCreateAliasCycle(t *testing.T) {
+func TestRepeatedReplacementCorrelationKeepsOneLogicalAccount(t *testing.T) {
 	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
 	mock := newMockPushover(t)
 	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
@@ -505,19 +659,107 @@ func TestRepeatedReplacementCorrelationCannotCreateAliasCycle(t *testing.T) {
 		}
 	}
 
-	done := make(chan struct{})
-	go func() {
-		monitor.deliveryCallback("claude:index-b", "disabled", 0)(notifier.DeliveryResult{Accepted: true, At: time.Now().UTC()})
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("delivery callback deadlocked while resolving replacement aliases")
-	}
 	rows := monitor.Snapshot().Accounts
-	if len(rows) != 1 || rows[0].AuthIndex != "index-a" {
+	if len(rows) != 1 || rows[0].AuthIndex != "index-a" || rows[0].Health != health.Healthy {
 		t.Fatalf("unexpected correlated account rows: %+v", rows)
+	}
+}
+
+func TestOldKeyReuseDoesNotInheritUncorrelatedIncidentState(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+
+	host.set(oauthEntry("index-x", "claude", "account-a@example.com", "error", "unauthorized", true))
+	if err := monitor.Reconcile(context.Background(), "original-failure"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
+	monitor.stateMu.RLock()
+	original := monitor.data.Accounts["claude:index-x"]
+	monitor.stateMu.RUnlock()
+
+	host.set(oauthEntry("index-x", "claude", "account-c@example.com", "active", "", false))
+	if err := monitor.Reconcile(context.Background(), "unrelated-key-reuse"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.stateMu.RLock()
+	reused := monitor.data.Accounts["claude:index-x"]
+	monitor.stateMu.RUnlock()
+	if reused == nil || reused == original || reused.Health != health.Healthy || reused.AlertSent || reused.IncidentGeneration != 0 || reused.RecoveryPendingFrom != "" {
+		t.Fatalf("unrelated key reuse inherited prior incident state: original=%+v reused=%+v", original, reused)
+	}
+	if mock.count() != 1 {
+		t.Fatalf("unrelated key reuse sent a spurious recovery: %s", mock.all())
+	}
+}
+
+func TestQueuedIncidentSurvivesReplacementAndOldKeyReuse(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	mock := newMockPushover(t)
+	monitor := newConfiguredTestMonitor(t, host, mock, func(cfg *config.Config) {
+		cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+		cfg.NotificationCoalesceWindow = time.Hour
+	})
+
+	accountAOld := oauthEntry("index-x", "claude", "account-a@example.com", "error", "unauthorized", true)
+	host.set(accountAOld)
+	if err := monitor.Reconcile(context.Background(), "account-a-old-key"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.stateMu.RLock()
+	originalAccount := monitor.data.Accounts["claude:index-x"]
+	originalGeneration := originalAccount.IncidentGeneration
+	monitor.stateMu.RUnlock()
+	if mock.count() != 0 {
+		t.Fatal("queued incident delivered before replacement correlation was exercised")
+	}
+
+	accountANew := oauthEntry("index-y", "claude", "account-a@example.com", "error", "unauthorized", true)
+	accountC := oauthEntry("index-x", "claude", "account-c@example.com", "active", "", false)
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{accountANew, accountC}
+	host.runtime[accountANew.AuthIndex] = accountANew
+	host.runtime[accountC.AuthIndex] = accountC
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "replacement-and-old-key-reuse"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.stateMu.RLock()
+	movedAccount := monitor.data.Accounts["claude:index-y"]
+	unrelatedBeforeDelivery := monitor.data.Accounts["claude:index-x"]
+	monitor.stateMu.RUnlock()
+	if movedAccount == nil || movedAccount != originalAccount {
+		t.Fatalf("replacement did not retain the original queued logical account: original=%p moved=%p", originalAccount, movedAccount)
+	}
+	if movedAccount.IncidentGeneration != originalGeneration {
+		t.Fatalf("replacement changed queued incident generation: got=%d want=%d", movedAccount.IncidentGeneration, originalGeneration)
+	}
+	if unrelatedBeforeDelivery == nil || unrelatedBeforeDelivery == originalAccount || unrelatedBeforeDelivery.Health != health.Healthy {
+		t.Fatalf("old-key reuse did not create an unrelated healthy account: %+v", unrelatedBeforeDelivery)
+	}
+	monitor.dispatcher.BeginDrain()
+
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool {
+		monitor.stateMu.RLock()
+		defer monitor.stateMu.RUnlock()
+		account := monitor.data.Accounts["claude:index-y"]
+		return account != nil && account.AlertSent
+	})
+	if messages := mock.all(); !strings.Contains(messages, "account-a@example.com") || strings.Contains(messages, "account-c@example.com") {
+		t.Fatalf("queued incident was delivered for the wrong logical account: %s", messages)
+	}
+	monitor.stateMu.RLock()
+	accountA := monitor.data.Accounts["claude:index-y"]
+	unrelatedC := monitor.data.Accounts["claude:index-x"]
+	monitor.stateMu.RUnlock()
+	if accountA == nil || !accountA.AlertSent || accountA.Health != health.ReauthRequired {
+		t.Fatalf("replacement account did not receive its queued delivery state: %+v", accountA)
+	}
+	if unrelatedC == nil || unrelatedC.AlertSent || unrelatedC.Health != health.Healthy {
+		t.Fatalf("reused old key was mutated by another account's callback: %+v", unrelatedC)
 	}
 }
 
@@ -543,7 +785,8 @@ func TestStaleRecoveryCannotCorruptNewFailureIncident(t *testing.T) {
 		t.Fatal(err)
 	}
 	monitor.stateMu.RLock()
-	oldGeneration := monitor.data.Accounts["claude:one"].IncidentGeneration
+	account := monitor.data.Accounts["claude:one"]
+	oldGeneration := account.IncidentGeneration
 	monitor.stateMu.RUnlock()
 
 	current = current.Add(time.Second)
@@ -551,7 +794,7 @@ func TestStaleRecoveryCannotCorruptNewFailureIncident(t *testing.T) {
 	if err := monitor.Reconcile(context.Background(), "failed-again"); err != nil {
 		t.Fatal(err)
 	}
-	monitor.deliveryCallback("claude:one", "recovery", oldGeneration)(notifier.DeliveryResult{Accepted: true, At: current.Add(time.Second)})
+	monitor.deliveryCallback(account, "recovery", oldGeneration)(notifier.DeliveryResult{Accepted: true, At: current.Add(time.Second)})
 
 	waitFor(t, 15*time.Second, func() bool { return mock.count() == 2 })
 	status := monitor.Snapshot().Accounts[0]
@@ -728,6 +971,55 @@ func TestStructured429NeverBecomesCredentialFailure(t *testing.T) {
 	}
 	if mock.count() != 0 {
 		t.Fatalf("quota limitation sent a credential alert: %s", mock.all())
+	}
+}
+
+func TestAvailableModelSuccessClears429WithoutPromotingResidualError(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	entry := oauthEntry("one", "claude", "a@example.com", "error", `{"model":"fable","status":"quota"}`, true)
+	host.set(entry)
+	mock := newMockPushover(t)
+	monitor := newConfiguredTestMonitor(t, host, mock, func(cfg *config.Config) {
+		cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+		cfg.NotificationCoalesceWindow = 0
+		cfg.TransientConfirmAfter = 10 * time.Minute
+	})
+	current := time.Now().UTC()
+	monitor.now = func() time.Time { return current }
+	monitor.ObserveUsageFailure("one", 429)
+	if err := monitor.Reconcile(context.Background(), "fable-429"); err != nil {
+		t.Fatal(err)
+	}
+	if got := monitor.Snapshot().Accounts[0].Health; got != health.QuotaLimited {
+		t.Fatalf("initial model-scoped 429 health=%q", got)
+	}
+
+	current = current.Add(time.Minute)
+	entry.Unavailable = false
+	entry.Status = "error"
+	entry.StatusMessage = `{"model":"fable","status":"quota","opus":"succeeded"}`
+	entry.NextRetryAfter = time.Time{}
+	entry.UpdatedAt = current
+	entry.Success = 1
+	host.set(entry)
+	if err := monitor.Reconcile(context.Background(), "opus-success"); err != nil {
+		t.Fatal(err)
+	}
+	if got := monitor.Snapshot().Accounts[0]; got.Health != health.Suspect || got.ReasonCode != string(health.ReasonAvailableResidualError) {
+		t.Fatalf("available residual status=%+v", got)
+	}
+
+	current = current.Add(11 * time.Minute)
+	entry.UpdatedAt = current
+	host.set(entry)
+	if err := monitor.Reconcile(context.Background(), "residual-still-present"); err != nil {
+		t.Fatal(err)
+	}
+	if got := monitor.Snapshot().Accounts[0]; got.Health != health.Suspect || got.ReasonCode != string(health.ReasonAvailableResidualError) {
+		t.Fatalf("available residual error promoted to account failure: %+v", got)
+	}
+	if mock.count() != 0 {
+		t.Fatalf("available residual model error sent an account alert: %s", mock.all())
 	}
 }
 

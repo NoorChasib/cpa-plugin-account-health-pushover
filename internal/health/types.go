@@ -67,6 +67,7 @@ const (
 	ReasonRequestFailed               ReasonCode = "request_failed"
 	ReasonCooldownActive              ReasonCode = "cooldown_active"
 	ReasonCooldownRecoveryUnconfirmed ReasonCode = "cooldown_recovery_unconfirmed"
+	ReasonAvailableResidualError      ReasonCode = "available_residual_error"
 	ReasonUnclassifiedCredentialError ReasonCode = "unclassified_credential_error"
 	ReasonRemoved                     ReasonCode = "removed"
 	ReasonDisabled                    ReasonCode = "disabled"
@@ -191,7 +192,8 @@ func NormalizeReasonCode(value string) ReasonCode {
 		ReasonPaymentRequired, ReasonNotFound, ReasonHTTP403, ReasonHTTP408,
 		ReasonHTTP500, ReasonHTTP502, ReasonHTTP503, ReasonHTTP504,
 		ReasonTransientUpstreamError, ReasonCloudflareChallenge, ReasonRequestFailed,
-		ReasonCooldownActive, ReasonCooldownRecoveryUnconfirmed, ReasonUnclassifiedCredentialError, ReasonRemoved, ReasonDisabled,
+		ReasonCooldownActive, ReasonCooldownRecoveryUnconfirmed, ReasonAvailableResidualError,
+		ReasonUnclassifiedCredentialError, ReasonRemoved, ReasonDisabled,
 		ReasonPersistentUnauthorized, ReasonPersistentHTTP403, ReasonPersistentHTTP408,
 		ReasonPersistentHTTP500, ReasonPersistentHTTP502, ReasonPersistentHTTP503,
 		ReasonPersistentHTTP504, ReasonPersistentTransient, ReasonPersistentCloudflare,

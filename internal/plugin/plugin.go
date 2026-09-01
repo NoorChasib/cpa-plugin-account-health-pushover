@@ -33,8 +33,9 @@ type Plugin struct {
 	host     Host
 	endpoint string
 
-	mu      sync.RWMutex
-	monitor *monitor.Monitor
+	lifecycleMu sync.Mutex
+	mu          sync.RWMutex
+	monitor     *monitor.Monitor
 }
 
 func New(host Host, endpoint string) *Plugin {
@@ -76,18 +77,26 @@ func (p *Plugin) configure(raw []byte) (protocol.Registration, error) {
 	dispatcher := notifier.NewDispatcher(client, 64, cfg.NotificationCoalesceWindow)
 	newMonitor := monitor.New(cfg, p.host, client, dispatcher)
 
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
 	p.mu.Lock()
 	oldMonitor := p.monitor
-	p.monitor = newMonitor
+	p.monitor = nil
 	p.mu.Unlock()
 	if oldMonitor != nil {
 		oldMonitor.Stop()
 	}
 	newMonitor.Start()
+	p.mu.Lock()
+	p.monitor = newMonitor
+	p.mu.Unlock()
 	return registration(), nil
 }
 
 func (p *Plugin) stop() {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	p.mu.Lock()
 	current := p.monitor
 	p.monitor = nil

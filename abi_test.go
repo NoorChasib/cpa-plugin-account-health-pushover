@@ -5,9 +5,91 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/protocol"
 )
+
+func TestHostCallGateDrainsBeforeNativeUnload(t *testing.T) {
+	var gate hostCallGate
+	done, ok := gate.begin()
+	if !ok {
+		t.Fatal("fresh host-call gate rejected admission")
+	}
+	gate.stopAccepting()
+
+	drained := make(chan struct{})
+	go func() {
+		gate.wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		t.Fatal("host-call drain returned while a callback was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, accepted := gate.begin(); accepted {
+		t.Fatal("host-call gate admitted a callback after shutdown started")
+	}
+
+	done()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("host-call drain did not finish after the callback returned")
+	}
+}
+
+func TestNativeShutdownDrainsCallbacksBeforeClearingHostAPI(t *testing.T) {
+	nativeLifecycleMu.Lock()
+	globalMu.Lock()
+	originalPlugin := globalPlugin
+	globalPlugin = nil
+	globalMu.Unlock()
+	hostCalls = hostCallGate{}
+	originalClear := clearStoredHostAPI
+	cleared := make(chan struct{})
+	clearStoredHostAPI = func() { close(cleared) }
+	nativeLifecycleMu.Unlock()
+	t.Cleanup(func() {
+		nativeLifecycleMu.Lock()
+		globalMu.Lock()
+		globalPlugin = originalPlugin
+		globalMu.Unlock()
+		hostCalls = hostCallGate{}
+		clearStoredHostAPI = originalClear
+		nativeLifecycleMu.Unlock()
+	})
+
+	finish, ok := hostCalls.begin()
+	if !ok {
+		t.Fatal("fresh native host-call gate rejected admission")
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		cliproxyPluginShutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-cleared:
+		t.Fatal("native shutdown cleared the host API while a callback was in flight")
+	case <-shutdownDone:
+		t.Fatal("native shutdown returned while a callback was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	finish()
+	select {
+	case <-cleared:
+	case <-time.After(time.Second):
+		t.Fatal("native shutdown did not clear the host API after callback drain")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("native shutdown did not return after clearing the host API")
+	}
+}
 
 func TestABIEnvelopesMatchHostContract(t *testing.T) {
 	raw, err := okEnvelope(map[string]any{"registered": true})

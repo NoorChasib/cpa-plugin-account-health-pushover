@@ -62,6 +62,125 @@ func configurePlugin(t *testing.T, host *pluginFakeHost, endpoint string) *Plugi
 	return p
 }
 
+type reconfigureBlockingHost struct {
+	mu      sync.Mutex
+	entry   protocol.HostAuthFileEntry
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *reconfigureBlockingHost) ListAuth(context.Context) ([]protocol.HostAuthFileEntry, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return []protocol.HostAuthFileEntry{h.entry}, nil
+}
+
+func (h *reconfigureBlockingHost) GetRuntime(context.Context, string) (protocol.HostAuthFileEntry, error) {
+	h.once.Do(func() { close(h.started) })
+	<-h.release
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.entry, nil
+}
+
+func (*reconfigureBlockingHost) Log(context.Context, string, string, map[string]any) {}
+
+func TestReconfigureWaitsForManagementCheckAndDeliversItsAlert(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	host := &reconfigureBlockingHost{
+		entry: protocol.HostAuthFileEntry{
+			AuthIndex: "one", Provider: "claude", Type: "claude", AccountType: "oauth", Email: "a@example.com", Status: "active",
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	notification := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		notification <- struct{}{}
+		_, _ = io.WriteString(w, `{"status":1}`)
+	}))
+	defer server.Close()
+
+	p := New(host, server.URL)
+	t.Cleanup(p.Shutdown)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	lifecycleRequest, err := json.Marshal(protocol.LifecycleRequest{ConfigYAML: []byte(
+		"enabled: true\nstartup-grace: 24h\nscan-interval: 24h\nstate-file: " + statePath + "\n",
+	), SchemaVersion: protocol.SchemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Handle(protocol.MethodPluginRegister, lifecycleRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	checkRequest, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/account-health-pushover/check"})
+	checkDone := make(chan error, 1)
+	go func() {
+		_, err := p.Handle(protocol.MethodManagementHandle, checkRequest)
+		checkDone <- err
+	}()
+	select {
+	case <-host.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("management check did not block in the old runtime callback")
+	}
+
+	reconfigureDone := make(chan error, 1)
+	go func() {
+		_, err := p.Handle(protocol.MethodPluginReconfigure, lifecycleRequest)
+		reconfigureDone <- err
+	}()
+	select {
+	case err := <-reconfigureDone:
+		t.Fatalf("reconfigure returned before the old management check: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.mu.RLock()
+		current := p.monitor
+		p.mu.RUnlock()
+		if current == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reconfigure published a replacement monitor before draining the old one")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	host.mu.Lock()
+	host.entry.Status = "error"
+	host.entry.StatusMessage = "unauthorized"
+	host.entry.Unavailable = true
+	host.mu.Unlock()
+	close(host.release)
+	select {
+	case err := <-checkDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("management check did not finish after runtime release")
+	}
+	select {
+	case <-notification:
+	case <-time.After(5 * time.Second):
+		t.Fatal("alert from the admitted old-monitor check was stranded during reconfigure")
+	}
+	select {
+	case err := <-reconfigureDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconfigure did not finish after the management check")
+	}
+}
+
 func TestRegistrationUsesCurrentABIContract(t *testing.T) {
 	p := New(&pluginFakeHost{}, "")
 	request, _ := json.Marshal(protocol.LifecycleRequest{ConfigYAML: []byte("enabled: false\n")})

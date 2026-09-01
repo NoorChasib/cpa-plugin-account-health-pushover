@@ -100,7 +100,7 @@ func (c *Client) Send(ctx context.Context, message Message) DeliveryResult {
 		return result
 	}
 	message.Title = BoundText(message.Title, 250)
-	message.Body = BoundMessage(message.Body, 1024)
+	message.Body = BoundMessage(message.Body, maxPushoverMessageRunes)
 	if message.Body == "" {
 		message.Body = "CLIProxyAPI account health notification"
 	}
@@ -227,8 +227,15 @@ type Dispatcher struct {
 	cancel         context.CancelFunc
 	done           chan struct{}
 	stopTimeout    time.Duration
-	started        atomic.Bool
 	dropped        atomic.Uint64
+
+	stateMu   sync.Mutex
+	accepting bool
+	started   bool
+	pending   int
+	idle      chan struct{}
+	flush     chan struct{}
+	flushOnce sync.Once
 }
 
 func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) *Dispatcher {
@@ -236,6 +243,8 @@ func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) 
 		queueSize = 64
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	idle := make(chan struct{})
+	close(idle)
 	return &Dispatcher{
 		client:         client,
 		queue:          make(chan Job, queueSize),
@@ -244,25 +253,46 @@ func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) 
 		cancel:         cancel,
 		done:           make(chan struct{}),
 		stopTimeout:    defaultStopTimeout,
+		accepting:      true,
+		idle:           idle,
+		flush:          make(chan struct{}),
 	}
 }
 
 func (d *Dispatcher) Start() {
-	if !d.started.CompareAndSwap(false, true) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if !d.accepting || d.started {
 		return
 	}
+	d.started = true
 	go d.run()
+}
+
+// BeginDrain closes enqueue admission and flushes any active coalescing window
+// without canceling accepted work. Callers can then wait on WaitIdle with a
+// separate bound before using Stop to cancel a stuck delivery.
+func (d *Dispatcher) BeginDrain() {
+	d.stateMu.Lock()
+	d.accepting = false
+	d.stateMu.Unlock()
+	d.flushOnce.Do(func() { close(d.flush) })
 }
 
 // Stop cancels any in-flight delivery (aborting the HTTP request or retry
 // backoff) and waits for the delivery worker to exit. The wait is hard-bounded
-// by stopTimeout so host lifecycle calls (quiesce, reconfigure, shutdown) can
-// never hang behind a stuck delivery: a worker that does not exit in time is
-// safely abandoned — it holds no locks Stop's caller needs, cannot start new
-// deliveries, and exits on its own once its blocking call returns.
+// by stopTimeout so host lifecycle calls never hang behind a stuck delivery: a
+// worker that does not exit in time is safely abandoned — it holds no locks
+// Stop's caller needs, cannot start new deliveries, and exits on its own once
+// its blocking call returns.
 func (d *Dispatcher) Stop() {
+	d.BeginDrain()
 	d.cancel()
-	if !d.started.Load() {
+	d.stateMu.Lock()
+	started := d.started
+	d.stateMu.Unlock()
+	if !started {
+		d.abandonQueued()
 		return
 	}
 	timer := time.NewTimer(d.stopTimeout)
@@ -274,8 +304,19 @@ func (d *Dispatcher) Stop() {
 }
 
 func (d *Dispatcher) Enqueue(job Job) bool {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if !d.accepting {
+		d.dropped.Add(1)
+		d.updateQueueStatus()
+		return false
+	}
 	select {
 	case d.queue <- job:
+		if d.pending == 0 {
+			d.idle = make(chan struct{})
+		}
+		d.pending++
 		d.updateQueueStatus()
 		return true
 	default:
@@ -285,20 +326,67 @@ func (d *Dispatcher) Enqueue(job Job) bool {
 	}
 }
 
+func (d *Dispatcher) WaitIdle(ctx context.Context) bool {
+	d.stateMu.Lock()
+	idle := d.idle
+	d.stateMu.Unlock()
+	select {
+	case <-idle:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (d *Dispatcher) finishJobs(count int) {
+	if count <= 0 {
+		return
+	}
+	d.stateMu.Lock()
+	if count > d.pending {
+		count = d.pending
+	}
+	if count == 0 {
+		d.stateMu.Unlock()
+		return
+	}
+	d.pending -= count
+	if d.pending == 0 {
+		close(d.idle)
+	}
+	d.stateMu.Unlock()
+}
+
+func (d *Dispatcher) abandonQueued() {
+	for {
+		select {
+		case <-d.queue:
+			d.finishJobs(1)
+		default:
+			d.updateQueueStatus()
+			return
+		}
+	}
+}
+
 func (d *Dispatcher) run() {
 	defer close(d.done)
 	for {
 		select {
 		case <-d.ctx.Done():
+			d.abandonQueued()
 			return
 		case first := <-d.queue:
 			batch, ok := d.collect(first)
 			if !ok {
+				d.finishJobs(len(batch))
+				d.abandonQueued()
 				return
 			}
 			d.updateQueueStatus()
 			d.deliverBatch(d.ctx, batch)
 			if d.ctx.Err() != nil {
+				d.abandonQueued()
 				return
 			}
 		}
@@ -324,8 +412,10 @@ func (d *Dispatcher) collect(first Job) ([]Job, bool) {
 			}
 		case <-timer.C:
 			return batch, true
+		case <-d.flush:
+			return batch, true
 		case <-d.ctx.Done():
-			return nil, false
+			return batch, false
 		}
 	}
 }
@@ -335,6 +425,7 @@ func (d *Dispatcher) collect(first Job) ([]Job, bool) {
 // retry backoff. The interrupted group's callbacks still receive the final
 // (canceled) result; groups not yet started are abandoned.
 func (d *Dispatcher) deliverBatch(parent context.Context, batch []Job) {
+	defer d.finishJobs(len(batch))
 	groups := make(map[string][]Job)
 	order := make([]string, 0)
 	for _, job := range batch {
@@ -362,16 +453,37 @@ func (d *Dispatcher) deliverBatch(parent context.Context, batch []Job) {
 		if len(jobs) == 0 {
 			continue
 		}
-		message := jobs[0].Message
-		if len(jobs) > 1 {
-			message = coalescedMessage(jobs)
+
+		coalesced := len(jobs) > 1
+		messageGroups := [][]Job{jobs}
+		if coalesced {
+			messageGroups = splitCoalescedJobs(jobs)
 		}
-		ctx, cancel := context.WithTimeout(parent, d.client.DeliveryTimeout())
-		result := d.client.Send(ctx, message)
-		cancel()
-		for _, job := range jobs {
-			if job.Callback != nil {
-				job.Callback(result)
+		for _, messageJobs := range messageGroups {
+			if parent.Err() != nil {
+				return
+			}
+			stillValid = messageJobs[:0]
+			for _, job := range messageJobs {
+				if job.Valid == nil || job.Valid() {
+					stillValid = append(stillValid, job)
+				}
+			}
+			messageJobs = stillValid
+			if len(messageJobs) == 0 {
+				continue
+			}
+			message := messageJobs[0].Message
+			if coalesced {
+				message = coalescedMessage(messageJobs)
+			}
+			ctx, cancel := context.WithTimeout(parent, d.client.DeliveryTimeout())
+			result := d.client.Send(ctx, message)
+			cancel()
+			for _, job := range messageJobs {
+				if job.Callback != nil {
+					job.Callback(result)
+				}
 			}
 		}
 	}
@@ -379,6 +491,26 @@ func (d *Dispatcher) deliverBatch(parent context.Context, batch []Job) {
 
 func (d *Dispatcher) updateQueueStatus() {
 	d.client.setQueue(len(d.queue), d.dropped.Load())
+}
+
+const maxPushoverMessageRunes = 1024
+
+func splitCoalescedJobs(jobs []Job) [][]Job {
+	groups := make([][]Job, 0, 1)
+	current := make([]Job, 0, len(jobs))
+	for _, job := range jobs {
+		candidate := append(append([]Job(nil), current...), job)
+		if len(current) > 0 && utf8.RuneCountInString(coalescedMessage(candidate).Body) > maxPushoverMessageRunes {
+			groups = append(groups, current)
+			current = []Job{job}
+			continue
+		}
+		current = candidate
+	}
+	if len(current) > 0 {
+		groups = append(groups, current)
+	}
+	return groups
 }
 
 func coalescedMessage(jobs []Job) Message {
@@ -397,18 +529,18 @@ func coalescedMessage(jobs []Job) Message {
 	body.WriteString(" account transitions were detected:\n")
 	for _, job := range jobs {
 		body.WriteString("- ")
-		body.WriteString(job.Message.Provider)
+		body.WriteString(BoundText(job.Message.Provider, 32))
 		body.WriteString(": ")
-		body.WriteString(job.Message.Label)
-		if job.Message.Reason != "" {
+		body.WriteString(BoundText(job.Message.Label, 120))
+		if reason := BoundText(job.Message.Reason, 80); reason != "" {
 			body.WriteString(" (")
-			body.WriteString(job.Message.Reason)
+			body.WriteString(reason)
 			body.WriteString(")")
 		}
 		body.WriteByte('\n')
 	}
 	first.Title = title
-	first.Body = BoundMessage(body.String(), 1024)
+	first.Body = strings.TrimSpace(body.String())
 	return first
 }
 
