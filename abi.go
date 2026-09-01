@@ -229,7 +229,7 @@ func callHost(ctx context.Context, method string, payload any) (json.RawMessage,
 		}
 		return nil, fmt.Errorf("host callback %s failed", method)
 	}
-	return append(json.RawMessage(nil), envelope.Result...), nil
+	return envelope.Result, nil
 }
 
 func okEnvelope(result any) ([]byte, error) {

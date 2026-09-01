@@ -161,7 +161,7 @@ func (m *Monitor) loop() {
 	// a wake queued for a follow-up scan, while an earlier event is included in
 	// the baseline through its retained evidence.
 	m.drainSignalWake()
-	m.takePendingBatch()
+	m.clearPending()
 	_ = m.Reconcile(m.ctx, "startup")
 
 	ticker := time.NewTicker(m.cfg.ScanInterval)
@@ -190,12 +190,12 @@ func (m *Monitor) processSignals() bool {
 		return false
 	case <-timer.C:
 	}
-	m.takePendingBatch()
+	m.clearPending()
 	_ = m.Reconcile(m.ctx, "usage_failure")
 	return true
 }
 
-func (m *Monitor) takePendingBatch() {
+func (m *Monitor) clearPending() {
 	m.pendingMu.Lock()
 	m.pending = make(map[string]struct{})
 	m.pendingMu.Unlock()
@@ -210,36 +210,21 @@ func (m *Monitor) drainSignalWake() {
 
 func (m *Monitor) ObserveUsageFailure(authIndex string, statusCode int) bool {
 	authIndex = strings.TrimSpace(authIndex)
-	if authIndex == "" || !m.cfg.Enabled || !supportedFailureStatus(statusCode) {
+	if authIndex == "" || !m.cfg.Enabled || !health.IsClassifiableFailureStatus(statusCode) {
 		return false
 	}
 	m.pendingMu.Lock()
 	m.evidence[authIndex] = health.FailureEvidence{HTTPStatus: statusCode, ObservedAt: m.now().UTC()}
-	if _, exists := m.pending[authIndex]; exists {
-		m.pendingMu.Unlock()
-		return true
-	}
 	wasEmpty := len(m.pending) == 0
 	m.pending[authIndex] = struct{}{}
 	m.pendingMu.Unlock()
-	if !wasEmpty {
-		return true
+	if wasEmpty {
+		select {
+		case m.signals <- struct{}{}:
+		default:
+		}
 	}
-	select {
-	case m.signals <- struct{}{}:
-		return true
-	default:
-		return true
-	}
-}
-
-func supportedFailureStatus(statusCode int) bool {
-	switch statusCode {
-	case 401, 403, 408, 429, 500, 502, 503, 504:
-		return true
-	default:
-		return false
-	}
+	return true
 }
 
 func (m *Monitor) failureEvidenceFor(entry protocol.HostAuthFileEntry, now time.Time) health.FailureEvidence {
@@ -463,7 +448,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 	account.QuotaLimited = observation.State == health.QuotaLimited
 	account.LastObservedAt = now
 	account.RemovedAt = time.Time{}
-	if observation.State == health.Healthy || observation.State == health.QuotaLimited {
+	if health.IsCredentialHealthy(observation.State) {
 		account.LastSuccessfulHealthObservation = now
 	}
 
@@ -471,7 +456,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 	firstDetected := time.Time{}
 	if newState == health.Suspect {
 		if observation.Confirmation == health.ConfirmationNone || !health.IsFailure(observation.ConfirmAs) {
-			clearSuspect(account)
+			account.ClearSuspect()
 		} else {
 			// A sustained outage can alternate among status codes within the same
 			// confirmation class (for example 502/503). Reset only when the class
@@ -491,7 +476,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 				firstDetected = account.SuspectSince
 				newState = observation.ConfirmAs
 				observation.ReasonCode = health.PersistentReason(observation.ReasonCode)
-				clearSuspect(account)
+				account.ClearSuspect()
 			}
 		}
 		// An ambiguous observation cannot prove that an already-confirmed
@@ -503,7 +488,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 			observation.ReasonCode = account.LastReasonCode
 		}
 	} else {
-		clearSuspect(account)
+		account.ClearSuspect()
 	}
 
 	previous := account.Health
@@ -531,13 +516,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 			}
 		} else if health.IsCredentialHealthy(newState) {
 			if account.AlertSent {
-				account.RecoveryPendingFrom = previous
-				if m.cfg.NotifyRecovery {
-					m.enqueueRecoveryLocked(account, now)
-				} else {
-					account.AlertSent = false
-					account.RecoveryPendingFrom = ""
-				}
+				m.beginRecoveryLocked(account, previous, now)
 			}
 			if !health.IsFailure(previous) && account.RecoveryPendingFrom == "" {
 				account.FirstDetectedAt = time.Time{}
@@ -546,7 +525,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 			account.AlertSent = false
 			account.RecoveryPendingFrom = ""
 			if m.cfg.NotifyDisabled {
-				m.enqueueInformationalLocked(account, "disabled", now)
+				m.enqueueInformationalLocked(account, "disabled")
 			}
 		}
 	} else {
@@ -562,13 +541,6 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 			m.enqueueRecoveryLocked(account, now)
 		}
 	}
-}
-
-func clearSuspect(account *state.Account) {
-	account.SuspectSince = time.Time{}
-	account.SuspectClass = health.ConfirmationNone
-	account.SuspectTarget = health.Unknown
-	account.SuspectReason = health.ReasonNone
 }
 
 func (m *Monitor) correlatedKeyLocked(snapshot health.RuntimeSnapshot, activeKeys map[string]struct{}) string {
@@ -608,6 +580,9 @@ func (m *Monitor) setAliasLocked(oldKey, newKey string) {
 }
 
 func (m *Monitor) resolveAccountKeyLocked(accountKey string) string {
+	if _, exists := m.data.Accounts[accountKey]; exists || len(m.aliases) == 0 {
+		return accountKey
+	}
 	visited := make(map[string]struct{}, len(m.aliases)+1)
 	for hops := 0; hops <= len(m.aliases); hops++ {
 		if _, exists := m.data.Accounts[accountKey]; exists {
@@ -647,8 +622,18 @@ func (m *Monitor) markRemoved(activeKeys map[string]struct{}, now time.Time) {
 		account.AlertSent = false
 		account.RecoveryPendingFrom = ""
 		if m.cfg.NotifyRemoved {
-			m.enqueueInformationalLocked(account, "removed", now)
+			m.enqueueInformationalLocked(account, "removed")
 		}
+	}
+}
+
+func (m *Monitor) beginRecoveryLocked(account *state.Account, from health.State, now time.Time) {
+	account.RecoveryPendingFrom = from
+	if m.cfg.NotifyRecovery {
+		m.enqueueRecoveryLocked(account, now)
+	} else {
+		account.AlertSent = false
+		account.RecoveryPendingFrom = ""
 	}
 }
 
@@ -660,45 +645,35 @@ func (m *Monitor) enqueueFailureLocked(account *state.Account, reminder bool, no
 	generation := account.IncidentGeneration
 	account.LastAlertAttemptAt = now
 	account.LastAlertAttemptGeneration = generation
-	job := notifier.Job{
-		Message:  m.failureMessage(account, reminder, now),
-		Valid:    m.deliveryValid(account.AccountKey, kind, generation),
-		Callback: m.deliveryCallback(account.AccountKey, kind, generation),
-	}
-	if !m.dispatcher.Enqueue(job) {
-		m.data.LastNotificationErr = "notification queue is full"
-	}
+	m.enqueueLocked(account.AccountKey, kind, generation, m.failureMessage(account, kind, now))
 }
 
 func (m *Monitor) enqueueRecoveryLocked(account *state.Account, now time.Time) {
 	generation := account.IncidentGeneration
 	account.LastRecoveryAttemptAt = now
-	job := notifier.Job{
-		Message:  m.recoveryMessage(account, now),
-		Valid:    m.deliveryValid(account.AccountKey, "recovery", generation),
-		Callback: m.deliveryCallback(account.AccountKey, "recovery", generation),
-	}
-	if !m.dispatcher.Enqueue(job) {
-		m.data.LastNotificationErr = "notification queue is full"
-	}
+	m.enqueueLocked(account.AccountKey, "recovery", generation, m.recoveryMessage(account, now))
 }
 
-func (m *Monitor) enqueueInformationalLocked(account *state.Account, kind string, now time.Time) {
+func (m *Monitor) enqueueInformationalLocked(account *state.Account, kind string) {
+	provider := titleProvider(account.Provider)
 	message := notifier.Message{
 		Kind:       kind,
-		Title:      fmt.Sprintf("CLIProxyAPI: %s account %s", titleProvider(account.Provider), kind),
-		Body:       fmt.Sprintf("%s account %s is now %s.", titleProvider(account.Provider), account.Label, kind),
+		Title:      fmt.Sprintf("CLIProxyAPI: %s account %s", provider, kind),
+		Body:       fmt.Sprintf("%s account %s is now %s.", provider, account.Label, kind),
 		Priority:   0,
-		Provider:   titleProvider(account.Provider),
+		Provider:   provider,
 		AccountKey: account.AccountKey,
 		Label:      account.Label,
 		Reason:     kind,
 	}
-	_ = now
+	m.enqueueLocked(account.AccountKey, kind, account.IncidentGeneration, message)
+}
+
+func (m *Monitor) enqueueLocked(accountKey, kind string, generation uint64, message notifier.Message) {
 	job := notifier.Job{
 		Message:  message,
-		Valid:    m.deliveryValid(account.AccountKey, kind, account.IncidentGeneration),
-		Callback: m.deliveryCallback(account.AccountKey, kind, account.IncidentGeneration),
+		Valid:    m.deliveryValid(accountKey, kind, generation),
+		Callback: m.deliveryCallback(accountKey, kind, generation),
 	}
 	if !m.dispatcher.Enqueue(job) {
 		m.data.LastNotificationErr = "notification queue is full"
@@ -749,13 +724,7 @@ func (m *Monitor) deliveryCallback(accountKey, kind string, generation uint64) f
 						account.LastAlertAt = result.At
 					}
 					if health.IsCredentialHealthy(account.Health) {
-						account.RecoveryPendingFrom = account.PreviousHealth
-						if m.cfg.NotifyRecovery {
-							m.enqueueRecoveryLocked(account, result.At)
-						} else {
-							account.AlertSent = false
-							account.RecoveryPendingFrom = ""
-						}
+						m.beginRecoveryLocked(account, account.PreviousHealth, result.At)
 					} else if account.Health == health.Disabled || account.Health == health.Removed {
 						account.AlertSent = false
 					}
@@ -783,16 +752,16 @@ func (m *Monitor) deliveryCallback(accountKey, kind string, generation uint64) f
 	}
 }
 
-func (m *Monitor) failureMessage(account *state.Account, reminder bool, now time.Time) notifier.Message {
+func (m *Monitor) failureMessage(account *state.Account, notificationKind string, now time.Time) notifier.Message {
 	provider := titleProvider(account.Provider)
-	kind := string(account.Health)
+	incidentKind := string(account.Health)
 	var title, body string
-	if reminder {
+	if notificationKind == "reminder" {
 		title = fmt.Sprintf("CLIProxyAPI: %s incident still unresolved", provider)
-		body = fmt.Sprintf("%s is still unavailable.\nIncident: %s\nReason: %s\nFirst detected: %s", account.Label, kind, account.LastReasonCode, formatTime(account.FirstDetectedAt))
+		body = fmt.Sprintf("%s is still unavailable.\nIncident: %s\nReason: %s\nFirst detected: %s", account.Label, incidentKind, account.LastReasonCode, formatTime(account.FirstDetectedAt))
 	} else if account.Health == health.ReauthRequired {
 		title = fmt.Sprintf("CLIProxyAPI: %s reauth required", provider)
-		body = fmt.Sprintf("%s is unavailable because its OAuth credentials were rejected.\nManual sign-in is required.\nIncident: %s\nReason: %s\nDetected: %s\nOther healthy accounts will continue routing if available.", account.Label, kind, account.LastReasonCode, formatTime(account.FirstDetectedAt))
+		body = fmt.Sprintf("%s is unavailable because its OAuth credentials were rejected.\nManual sign-in is required.\nIncident: %s\nReason: %s\nDetected: %s\nOther healthy accounts will continue routing if available.", account.Label, incidentKind, account.LastReasonCode, formatTime(account.FirstDetectedAt))
 	} else {
 		title = fmt.Sprintf("CLIProxyAPI: %s account down", provider)
 		duration := time.Duration(0)
@@ -802,13 +771,13 @@ func (m *Monitor) failureMessage(account *state.Account, reminder bool, now time
 		if duration < 0 {
 			duration = 0
 		}
-		body = fmt.Sprintf("%s has been unusable for %s because of a persistent credential error.\nIncident: %s\nReason: %s\nCheck the CLIProxyAPI auth status.", account.Label, duration, kind, account.LastReasonCode)
+		body = fmt.Sprintf("%s has been unusable for %s because of a persistent credential error.\nIncident: %s\nReason: %s\nCheck the CLIProxyAPI auth status.", account.Label, duration, incidentKind, account.LastReasonCode)
 	}
 	if m.cfg.ManagementURL != "" {
 		body += "\nManagement: " + m.cfg.ManagementURL
 	}
 	return notifier.Message{
-		Kind:       map[bool]string{true: "reminder", false: "failure"}[reminder],
+		Kind:       notificationKind,
 		Title:      title,
 		Body:       body,
 		Priority:   m.cfg.FailurePriority,

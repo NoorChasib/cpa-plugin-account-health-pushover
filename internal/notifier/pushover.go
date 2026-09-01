@@ -228,9 +228,7 @@ type Dispatcher struct {
 	done           chan struct{}
 	stopTimeout    time.Duration
 	started        atomic.Bool
-
-	mu      sync.Mutex
-	dropped uint64
+	dropped        atomic.Uint64
 }
 
 func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) *Dispatcher {
@@ -281,9 +279,7 @@ func (d *Dispatcher) Enqueue(job Job) bool {
 		d.updateQueueStatus()
 		return true
 	default:
-		d.mu.Lock()
-		d.dropped++
-		d.mu.Unlock()
+		d.dropped.Add(1)
 		d.updateQueueStatus()
 		return false
 	}
@@ -382,10 +378,7 @@ func (d *Dispatcher) deliverBatch(parent context.Context, batch []Job) {
 }
 
 func (d *Dispatcher) updateQueueStatus() {
-	d.mu.Lock()
-	dropped := d.dropped
-	d.mu.Unlock()
-	d.client.setQueue(len(d.queue), dropped)
+	d.client.setQueue(len(d.queue), d.dropped.Load())
 }
 
 func coalescedMessage(jobs []Job) Message {

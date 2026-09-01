@@ -12,10 +12,7 @@ func Discover(roster []protocol.HostAuthFileEntry, cfg config.Config) []protocol
 	result := make([]protocol.HostAuthFileEntry, 0, len(roster))
 	seen := make(map[string]struct{}, len(roster))
 	for _, entry := range roster {
-		provider := strings.ToLower(strings.TrimSpace(entry.Provider))
-		if provider == "" {
-			provider = strings.ToLower(strings.TrimSpace(entry.Type))
-		}
+		provider := providerOf(entry)
 		if !cfg.ProviderEnabled(provider) || !IsOAuthCredential(entry) {
 			continue
 		}

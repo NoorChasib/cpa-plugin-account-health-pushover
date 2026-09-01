@@ -46,6 +46,15 @@ type Account struct {
 	QuotaLimited                    bool                     `json:"quota_limited"`
 }
 
+// ClearSuspect resets confirmation metadata when an account is not carrying a
+// valid typed suspicion.
+func (a *Account) ClearSuspect() {
+	a.SuspectSince = time.Time{}
+	a.SuspectClass = health.ConfirmationNone
+	a.SuspectTarget = health.Unknown
+	a.SuspectReason = health.ReasonNone
+}
+
 type Data struct {
 	Version             int                 `json:"version"`
 	UpdatedAt           time.Time           `json:"updated_at"`
@@ -94,18 +103,12 @@ func (s Store) Load() (Data, error) {
 			validClass := account.SuspectClass == health.ConfirmationTransient || account.SuspectClass == health.ConfirmationUnauthorized
 			validTarget := account.SuspectTarget == health.CredentialDown || account.SuspectTarget == health.ReauthRequired
 			if !validClass || !validTarget || account.SuspectReason == health.ReasonNone {
-				account.SuspectSince = time.Time{}
-				account.SuspectClass = health.ConfirmationNone
-				account.SuspectTarget = health.Unknown
-				account.SuspectReason = health.ReasonNone
+				account.ClearSuspect()
 			} else {
 				account.SuspectReason = health.NormalizeReasonCode(string(account.SuspectReason))
 			}
 		} else {
-			account.SuspectSince = time.Time{}
-			account.SuspectClass = health.ConfirmationNone
-			account.SuspectTarget = health.Unknown
-			account.SuspectReason = health.ReasonNone
+			account.ClearSuspect()
 		}
 	}
 	if data.LastNotificationErr != "" {

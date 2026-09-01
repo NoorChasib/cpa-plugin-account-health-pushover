@@ -22,7 +22,6 @@ const (
 	ReauthRequired State = "reauth_required"
 	Disabled       State = "disabled"
 	Removed        State = "removed"
-	Recovering     State = "recovering"
 )
 
 type RuntimeMessageCode string
@@ -101,21 +100,15 @@ type FailureEvidence struct {
 
 type RuntimeSnapshot struct {
 	AuthKey        string
-	AuthID         string
 	AuthIndex      string
 	Provider       string
 	Label          string
 	Identity       string
-	Path           string
 	Disabled       bool
 	Unavailable    bool
 	Status         string
 	MessageCode    RuntimeMessageCode
 	NextRetryAfter time.Time
-	LastRefresh    time.Time
-	UpdatedAt      time.Time
-	Success        int64
-	Failed         int64
 	Evidence       FailureEvidence
 	ObservedAt     time.Time
 }
@@ -130,33 +123,31 @@ type Observation struct {
 }
 
 type ProviderClassifier interface {
-	ProviderID() string
 	Classify(RuntimeSnapshot) Observation
 }
 
-func FromHostEntry(entry protocol.HostAuthFileEntry, evidence FailureEvidence, now time.Time) RuntimeSnapshot {
+func providerOf(entry protocol.HostAuthFileEntry) string {
 	provider := strings.ToLower(strings.TrimSpace(entry.Provider))
 	if provider == "" {
 		provider = strings.ToLower(strings.TrimSpace(entry.Type))
 	}
+	return provider
+}
+
+func FromHostEntry(entry protocol.HostAuthFileEntry, evidence FailureEvidence, now time.Time) RuntimeSnapshot {
+	provider := providerOf(entry)
 	index := strings.TrimSpace(entry.AuthIndex)
 	return RuntimeSnapshot{
 		AuthKey:        AccountKey(provider, index),
-		AuthID:         safeText(entry.ID, 128),
 		AuthIndex:      safeText(index, 128),
 		Provider:       safeText(provider, 32),
 		Label:          SafeLabel(entry),
 		Identity:       IdentityFingerprint(entry),
-		Path:           entry.Path,
 		Disabled:       entry.Disabled,
 		Unavailable:    entry.Unavailable,
 		Status:         strings.ToLower(strings.TrimSpace(entry.Status)),
 		MessageCode:    CanonicalRuntimeMessage(entry.StatusMessage),
 		NextRetryAfter: entry.NextRetryAfter,
-		LastRefresh:    entry.LastRefresh,
-		UpdatedAt:      entry.UpdatedAt,
-		Success:        entry.Success,
-		Failed:         entry.Failed,
 		Evidence:       evidence,
 		ObservedAt:     now,
 	}

@@ -135,7 +135,7 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 	}
 	switch {
 	case method == http.MethodGet && strings.HasSuffix(path, "/status"):
-		if strings.Contains(path, "/v0/management/plugins/") || strings.Contains(path, "/management/plugins/") {
+		if strings.Contains(path, "/management/plugins/") {
 			return jsonResponse(http.StatusOK, current.Snapshot()), nil
 		}
 		return htmlResponse(http.StatusOK, renderStatusPage(redactResourceStatus(current.Snapshot()))), nil
@@ -150,7 +150,8 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 		cancel()
 		if !result.Accepted {
 			statusCode := http.StatusBadGateway
-			if strings.Contains(strings.ToLower(result.Error), "not configured") || strings.Contains(strings.ToLower(result.Error), "invalid format") {
+			errorText := strings.ToLower(result.Error)
+			if strings.Contains(errorText, "not configured") || strings.Contains(errorText, "invalid format") {
 				statusCode = http.StatusServiceUnavailable
 			}
 			return jsonResponse(statusCode, map[string]any{"accepted": false, "error": result.Error}), nil

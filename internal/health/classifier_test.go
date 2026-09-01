@@ -140,6 +140,19 @@ func TestClassifierUsesProductionAvailableEvidence(t *testing.T) {
 	}
 }
 
+func TestClassifiableFailureStatusUsesClosedMapping(t *testing.T) {
+	for _, statusCode := range []int{401, 403, 408, 429, 500, 502, 503, 504} {
+		if !IsClassifiableFailureStatus(statusCode) {
+			t.Fatalf("status %d was not classifiable", statusCode)
+		}
+	}
+	for _, statusCode := range []int{0, 200, 400, 402, 404, 409, 499, 501, 505} {
+		if IsClassifiableFailureStatus(statusCode) {
+			t.Fatalf("status %d escaped the closed mapping", statusCode)
+		}
+	}
+}
+
 func TestCanonicalRuntimeMessageRejectsFreeFormBodies(t *testing.T) {
 	for input, want := range map[string]RuntimeMessageCode{
 		"unauthorized":             RuntimeMessageUnauthorized,

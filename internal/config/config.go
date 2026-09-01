@@ -1,13 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -117,7 +118,7 @@ func Default() Config {
 
 func Parse(data []byte) (Config, error) {
 	cfg := Default()
-	if len(strings.TrimSpace(string(data))) == 0 {
+	if len(bytes.TrimSpace(data)) == 0 {
 		return cfg, nil
 	}
 	var raw rawConfig
@@ -199,7 +200,7 @@ func (c *Config) Validate() error {
 		return errors.New("providers must contain at least one provider")
 	}
 	seen := make(map[string]struct{}, len(c.Providers))
-	for i, provider := range c.Providers {
+	for _, provider := range c.Providers {
 		provider = strings.ToLower(strings.TrimSpace(provider))
 		if provider == "" {
 			return errors.New("providers must not contain an empty value")
@@ -208,7 +209,6 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("unsupported provider %q", provider)
 		}
 		seen[provider] = struct{}{}
-		c.Providers[i] = provider
 	}
 	if c.ScanInterval <= 0 {
 		return errors.New("scan-interval must be greater than zero")
@@ -249,8 +249,7 @@ func (c *Config) Validate() error {
 			return errors.New("management-url must be an absolute HTTP(S) URL without embedded credentials")
 		}
 	}
-	c.Providers = mapsKeys(seen)
-	sort.Strings(c.Providers)
+	c.Providers = slices.Sorted(maps.Keys(seen))
 	return nil
 }
 
@@ -306,12 +305,4 @@ func secretValue(envName, fileName string, getenv func(string) string) (string, 
 		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
-}
-
-func mapsKeys(m map[string]struct{}) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	return keys
 }
