@@ -101,8 +101,8 @@ plugins:
       pushover-user-key-env: CPA_PUSHOVER_USER_KEY
 YAML
 
-APP_TOKEN="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-USER_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+APP_TOKEN="$(printf 'A%.0s' {1..30})"
+USER_KEY="$(printf 'B%.0s' {1..30})"
 docker network create "$NETWORK" >/dev/null
 docker run -d --name "$MOCK_CONTAINER" --network "$NETWORK" --network-alias host.docker.internal \
   -v "$TMP_DIR:/work" \

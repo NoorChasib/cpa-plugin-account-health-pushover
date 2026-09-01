@@ -88,6 +88,8 @@ func oauthEntry(index, provider, email, status, message string, unavailable bool
 
 type mockPushover struct {
 	server     *httptest.Server
+	endpoint   string
+	path       string
 	mu         sync.Mutex
 	messages   []string
 	priorities []string
@@ -98,7 +100,14 @@ type mockPushover struct {
 func newMockPushover(t *testing.T) *mockPushover {
 	t.Helper()
 	mock := &mockPushover{status: http.StatusOK, body: `{"status":1}`}
+	mock.path = fmt.Sprintf("/pushover-%p", mock)
 	mock.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A unique endpoint prevents a canceled request from a prior test from
+		// being counted if the OS reuses an httptest listener port.
+		if r.URL.Path != mock.path {
+			http.NotFound(w, r)
+			return
+		}
 		_ = r.ParseForm()
 		mock.mu.Lock()
 		mock.messages = append(mock.messages, r.PostForm.Get("title")+"\n"+r.PostForm.Get("message"))
@@ -108,6 +117,7 @@ func newMockPushover(t *testing.T) *mockPushover {
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
 	}))
+	mock.endpoint = mock.server.URL + mock.path
 	t.Cleanup(mock.server.Close)
 	return mock
 }
@@ -159,7 +169,7 @@ func newConfiguredTestMonitor(t *testing.T, host *fakeHost, mock *mockPushover, 
 	if configure != nil {
 		configure(&cfg)
 	}
-	client := notifier.NewClient(cfg, mock.server.URL, mock.server.Client())
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
 	dispatcher := notifier.NewDispatcher(client, 64, cfg.NotificationCoalesceWindow)
 	monitor := New(cfg, host, client, dispatcher)
 	monitor.Start()
@@ -566,7 +576,10 @@ func TestReminderInFlightIsNotQueuedTwice(t *testing.T) {
 	if err := monitor.Reconcile(context.Background(), "failure"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool { return mock.count() >= 1 })
+	if count := mock.count(); count != 1 {
+		t.Fatalf("initial failure was delivered %d times, want exactly once", count)
+	}
 	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
 
 	current = current.Add(13 * time.Hour)
@@ -585,7 +598,10 @@ func TestReminderInFlightIsNotQueuedTwice(t *testing.T) {
 	if !secondAttempt.Equal(firstAttempt) {
 		t.Fatalf("duplicate in-flight reminder was queued: first=%s second=%s", firstAttempt, secondAttempt)
 	}
-	waitFor(t, 5*time.Second, func() bool { return mock.count() == 2 })
+	waitFor(t, 5*time.Second, func() bool { return mock.count() >= 2 })
+	if count := mock.count(); count != 2 {
+		t.Fatalf("reminder was delivered %d times total, want exactly twice", count)
+	}
 }
 
 func TestStateLoadWaitsForDiscoveredAuthDirectory(t *testing.T) {
@@ -993,7 +1009,7 @@ func TestReconcileManyAccountsRespectsConcurrencyLimit(t *testing.T) {
 	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
 	cfg.MaxConcurrentChecks = 3
 	cfg.NotificationCoalesceWindow = 0
-	client := notifier.NewClient(cfg, mock.server.URL, mock.server.Client())
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
 	dispatcher := notifier.NewDispatcher(client, 64, 0)
 	monitor := New(cfg, host, client, dispatcher)
 	monitor.Start()
