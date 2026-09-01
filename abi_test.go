@@ -11,7 +11,8 @@ import (
 )
 
 func TestHostCallGateDrainsBeforeNativeUnload(t *testing.T) {
-	var gate hostCallGate
+	waitStarted := make(chan struct{})
+	gate := hostCallGate{waitStarted: func() { close(waitStarted) }}
 	done, ok := gate.begin()
 	if !ok {
 		t.Fatal("fresh host-call gate rejected admission")
@@ -24,9 +25,14 @@ func TestHostCallGateDrainsBeforeNativeUnload(t *testing.T) {
 		close(drained)
 	}()
 	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("host-call drain did not reach its wait")
+	}
+	select {
 	case <-drained:
 		t.Fatal("host-call drain returned while a callback was still in flight")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	if _, accepted := gate.begin(); accepted {
 		t.Fatal("host-call gate admitted a callback after shutdown started")
@@ -46,7 +52,8 @@ func TestNativeShutdownDrainsCallbacksBeforeClearingHostAPI(t *testing.T) {
 	originalPlugin := globalPlugin
 	globalPlugin = nil
 	globalMu.Unlock()
-	hostCalls = hostCallGate{}
+	waitStarted := make(chan struct{})
+	hostCalls = hostCallGate{waitStarted: func() { close(waitStarted) }}
 	originalClear := clearStoredHostAPI
 	cleared := make(chan struct{})
 	clearStoredHostAPI = func() { close(cleared) }
@@ -71,11 +78,16 @@ func TestNativeShutdownDrainsCallbacksBeforeClearingHostAPI(t *testing.T) {
 		close(shutdownDone)
 	}()
 	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("native shutdown did not reach the host-callback wait")
+	}
+	select {
 	case <-cleared:
 		t.Fatal("native shutdown cleared the host API while a callback was in flight")
 	case <-shutdownDone:
 		t.Fatal("native shutdown returned while a callback was in flight")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	finish()

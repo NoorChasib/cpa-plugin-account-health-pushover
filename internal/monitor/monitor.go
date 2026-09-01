@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/protocol"
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/state"
 )
+
+var ErrStopping = errors.New("monitor is stopping")
 
 const (
 	notificationRetryAfter = 5 * time.Minute
@@ -69,21 +72,31 @@ type Monitor struct {
 	dispatcher  *notifier.Dispatcher
 	now         func() time.Time
 
-	reconcileMu sync.Mutex
-	stateMu     sync.RWMutex
-	data        state.Data
-	store       state.Store
-	stateLoaded bool
-	status      Status
+	reconcileMu         sync.Mutex
+	beforeReconcileLock func()
+	stateMu             sync.RWMutex
+	data                state.Data
+	store               state.Store
+	stateLoaded         bool
+	rollbackPending     atomic.Bool
+	status              Status
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	loopWG sync.WaitGroup
 
-	lifecycleMu sync.Mutex
-	operations  sync.WaitGroup
-	stopping    bool
-	stopOnce    sync.Once
+	lifecycleMu               sync.Mutex
+	operations                sync.WaitGroup
+	stopping                  bool
+	stopStartOnce             sync.Once
+	stopFinishOnce            sync.Once
+	drained                   chan struct{}
+	retirementDone            chan struct{}
+	retiring                  atomic.Bool
+	retired                   bool
+	beforeFinalWait           func()
+	beforeFinalDispatcherWait func()
+	beforeRetirementSave      func()
 
 	signals   chan struct{}
 	pendingMu sync.Mutex
@@ -105,11 +118,13 @@ func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *noti
 			PluginEnabled:   cfg.Enabled,
 			StateFileHealth: "not_initialized",
 		},
-		ctx:      ctx,
-		cancel:   cancel,
-		signals:  make(chan struct{}, 1),
-		pending:  make(map[string]struct{}),
-		evidence: make(map[string]health.FailureEvidence),
+		ctx:            ctx,
+		cancel:         cancel,
+		drained:        make(chan struct{}),
+		retirementDone: make(chan struct{}),
+		signals:        make(chan struct{}, 1),
+		pending:        make(map[string]struct{}),
+		evidence:       make(map[string]health.FailureEvidence),
 	}
 }
 
@@ -128,29 +143,164 @@ func (m *Monitor) Start() {
 }
 
 // Stop closes reconciliation admission before waiting, so WaitGroup.Add can
-// never race with Wait. Every admitted reconciliation is allowed to return,
-// even when a host callback ignores context cancellation; only then is the
-// bounded, cancellation-aware notification dispatcher stopped.
+// never race with Wait. Final shutdown waits without a bound for every admitted
+// reconciliation, including a host callback that ignores context cancellation.
 func (m *Monitor) Stop() {
-	m.stopOnce.Do(func() {
+	m.beginStop()
+	if m.beforeFinalWait != nil {
+		m.beforeFinalWait()
+	}
+	<-m.drained
+	m.finishStop(time.Time{})
+	if m.beforeFinalDispatcherWait != nil {
+		m.beforeFinalDispatcherWait()
+	}
+	m.dispatcher.StopAndWait()
+	<-m.retirementDone
+}
+
+// StopWithin closes reconciliation admission and retires the monitor within a
+// bounded lifecycle budget. A false return means an admitted reconciliation is
+// still unwinding and must be waited during final shutdown.
+func (m *Monitor) StopWithin(timeout time.Duration) bool {
+	m.beginStop()
+	deadline := time.Now().Add(timeout)
+	drained := false
+	if timeout > 0 {
+		// Reserve half of the lifecycle budget for notifier cancellation,
+		// unattempted terminal bookkeeping, and retirement handoff.
+		operationBudget := timeout - timeout/2
+		timer := time.NewTimer(operationBudget)
+		select {
+		case <-m.drained:
+			drained = true
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+		}
+	} else {
+		select {
+		case <-m.drained:
+			drained = true
+		default:
+		}
+	}
+	m.finishStop(deadline)
+	if !drained {
+		select {
+		case <-m.drained:
+			drained = true
+		default:
+		}
+	}
+	return drained
+}
+
+func (m *Monitor) beginStop() {
+	m.stopStartOnce.Do(func() {
 		m.lifecycleMu.Lock()
 		m.stopping = true
 		m.cancel()
 		m.lifecycleMu.Unlock()
-
-		m.loopWG.Wait()
-		m.operations.Wait()
-
-		// Stop accepting notification work and flush any coalescing delay before
-		// giving already-accepted jobs a bounded opportunity to finish. This keeps
-		// reconfigure from spending the drain budget on the coalescing window and
-		// then canceling the actual delivery.
-		m.dispatcher.BeginDrain()
-		drainCtx, cancelDrain := context.WithTimeout(context.Background(), m.notificationDrainTimeout())
-		m.dispatcher.WaitIdle(drainCtx)
-		cancelDrain()
-		m.dispatcher.Stop()
+		go func() {
+			m.loopWG.Wait()
+			m.operations.Wait()
+			close(m.drained)
+		}()
 	})
+}
+
+func (m *Monitor) finishStop(deadline time.Time) {
+	m.stopFinishOnce.Do(func() {
+		m.dispatcher.BeginDrain()
+		if deadline.IsZero() {
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), m.notificationDrainTimeout())
+			m.dispatcher.WaitIdle(drainCtx)
+			cancelDrain()
+			m.dispatcher.Stop()
+		} else {
+			remaining := time.Until(deadline)
+			if remaining > 0 {
+				// A quick graceful drain preserves alerts whose reconciliation won
+				// admission, while retaining a cancellation budget for queued jobs
+				// behind a delivery that ignores context cancellation.
+				drainCtx, cancelDrain := context.WithTimeout(context.Background(), remaining/2)
+				m.dispatcher.WaitIdle(drainCtx)
+				cancelDrain()
+			}
+			m.dispatcher.StopWithin(time.Until(deadline))
+		}
+		m.retiring.Store(true)
+		m.startRetirement(deadline)
+	})
+}
+
+func (m *Monitor) startRetirement(deadline time.Time) {
+	if deadline.IsZero() {
+		go m.completeRetirement()
+		return
+	}
+	for {
+		if m.stateMu.TryLock() {
+			m.completeRetirementLocked()
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			go m.completeRetirement()
+			return
+		}
+		pause := time.Millisecond
+		if remaining < pause {
+			pause = remaining
+		}
+		timer := time.NewTimer(pause)
+		<-timer.C
+	}
+}
+
+func (m *Monitor) completeRetirement() {
+	m.stateMu.Lock()
+	m.completeRetirementLocked()
+}
+
+func (m *Monitor) completeRetirementLocked() {
+	loaded := m.stateLoaded
+	store := m.store
+	shouldSave := loaded && m.rollbackPending.Load()
+	var snapshot state.Data
+	if shouldSave {
+		snapshot = state.Clone(m.data)
+	}
+	m.status.Accounts = accountStatuses(m.data, m.cfg.ReminderInterval)
+	m.retired = true
+	m.stateMu.Unlock()
+
+	go func() {
+		if shouldSave {
+			if m.beforeRetirementSave != nil {
+				m.beforeRetirementSave()
+			}
+			_ = store.Save(snapshot)
+		}
+		if loaded {
+			store.Release()
+		}
+		close(m.retirementDone)
+	}()
+}
+
+func (m *Monitor) isRetired() bool {
+	if m.retiring.Load() {
+		return true
+	}
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.retired
 }
 
 func (m *Monitor) beginOperation() bool {
@@ -276,17 +426,56 @@ func (m *Monitor) pruneFailureEvidence(candidates []protocol.HostAuthFileEntry, 
 	}
 }
 
+func (m *Monitor) lockReconcile(ctx context.Context) error {
+	if m.beforeReconcileLock != nil {
+		m.beforeReconcileLock()
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if m.reconcileMu.TryLock() {
+			if m.ctx.Err() != nil {
+				m.reconcileMu.Unlock()
+				return ErrStopping
+			}
+			if err := ctx.Err(); err != nil {
+				m.reconcileMu.Unlock()
+				return err
+			}
+			return nil
+		}
+		select {
+		case <-m.ctx.Done():
+			return ErrStopping
+		case <-ctx.Done():
+			if m.ctx.Err() != nil {
+				return ErrStopping
+			}
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 	if !m.beginOperation() {
-		return context.Canceled
+		return ErrStopping
 	}
 	defer m.operations.Done()
 
-	m.reconcileMu.Lock()
+	if err := m.lockReconcile(ctx); err != nil {
+		return err
+	}
 	defer m.reconcileMu.Unlock()
+	if m.isRetired() {
+		return ErrStopping
+	}
 	now := m.now().UTC()
 	roster, err := m.host.ListAuth(ctx)
 	if err != nil {
+		if m.isRetired() {
+			return ErrStopping
+		}
 		message := "host.auth.list failed; previous account state was retained"
 		m.recordMonitoringFailure(now, message)
 		m.host.Log(ctx, "warn", message, map[string]any{"trigger": safeField(trigger)})
@@ -294,7 +483,16 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 	}
 	candidates := health.Discover(roster, m.cfg)
 	m.pruneFailureEvidence(candidates, now)
-	m.ensureStateLoaded(roster)
+	loadWarning, loadErr := m.ensureStateLoaded(ctx, roster)
+	if loadErr != nil {
+		return loadErr
+	}
+	if loadWarning {
+		m.host.Log(ctx, "warn", "account-health state could not be loaded; starting with an empty safe state", nil)
+		if m.isRetired() {
+			return ErrStopping
+		}
+	}
 
 	type result struct {
 		entry       protocol.HostAuthFileEntry
@@ -340,6 +538,9 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 	}
 	wg.Wait()
 	close(results)
+	if m.isRetired() {
+		return ErrStopping
+	}
 
 	items := make([]result, 0, len(candidates))
 	for item := range results {
@@ -350,34 +551,65 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 	})
 
 	activeKeys := make(map[string]struct{}, len(candidates))
-	identityCounts := make(map[string]int, len(candidates))
 	for _, candidate := range candidates {
 		activeKeys[health.AccountKey(candidate.Provider, candidate.AuthIndex)] = struct{}{}
-		if identity := health.IdentityFingerprint(candidate); identity != "" {
-			identityCounts[candidate.Provider+"\x00"+identity]++
+	}
+
+	// Correlation authority comes from the complete scan. Count each identity at
+	// most once per candidate even when auth.list and get_runtime report the same
+	// value, while allowing runtime enrichment to expose cross-candidate
+	// ambiguity before either the exact pre-pass or fallback can move state.
+	scanIdentityCounts := make(map[string]int, len(items))
+	runtimeIdentities := make(map[string]string, len(items))
+	runtimeObserved := make(map[string]bool, len(items))
+	for _, item := range items {
+		candidateIdentities := make(map[string]struct{}, 2)
+		if identity := health.IdentityFingerprint(item.entry); identity != "" {
+			candidateIdentities[identityCountKey(item.entry.Provider, identity)] = struct{}{}
+		}
+		if item.err == nil {
+			accountKey := health.AccountKey(item.entry.Provider, item.entry.AuthIndex)
+			runtimeObserved[accountKey] = true
+			runtimeIdentities[accountKey] = item.snapshot.Identity
+			if item.snapshot.Identity != "" {
+				candidateIdentities[identityCountKey(item.snapshot.Provider, item.snapshot.Identity)] = struct{}{}
+			}
+		}
+		for key := range candidateIdentities {
+			scanIdentityCounts[key]++
 		}
 	}
-	m.correlateReplacementCandidates(candidates, identityCounts)
+	m.correlateReplacementCandidates(candidates, scanIdentityCounts, runtimeIdentities, runtimeObserved)
 
 	partialFailure := false
+	var runtimeContextErr error
 	failedEntries := make([]protocol.HostAuthFileEntry, 0)
 	for _, item := range items {
 		if item.err != nil {
 			partialFailure = true
+			if errors.Is(item.err, context.DeadlineExceeded) {
+				runtimeContextErr = context.DeadlineExceeded
+			} else if runtimeContextErr == nil && errors.Is(item.err, context.Canceled) {
+				runtimeContextErr = context.Canceled
+			}
 			failedEntries = append(failedEntries, item.entry)
 			continue
 		}
-		m.applyObservation(item.snapshot, item.observation, activeKeys, now)
+		m.applyObservation(item.snapshot, item.observation, activeKeys, scanIdentityCounts, now)
 	}
 	for _, entry := range failedEntries {
 		identity := health.IdentityFingerprint(entry)
-		if identity != "" && identityCounts[entry.Provider+"\x00"+identity] == 1 {
+		if identity != "" && scanIdentityCounts[identityCountKey(entry.Provider, identity)] == 1 {
 			m.preserveReplacementCandidate(entry, activeKeys)
 		}
 	}
 	m.markRemoved(activeKeys, now)
 
 	m.stateMu.Lock()
+	if m.retiring.Load() || m.retired {
+		m.stateMu.Unlock()
+		return ErrStopping
+	}
 	state.PruneRemoved(&m.data, now, m.effectiveRemovedStateRetention())
 	persistErr := m.persistLocked()
 	m.status.LastScan = now
@@ -395,14 +627,17 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 		m.host.Log(ctx, "warn", "account-health state persistence failed", map[string]any{"trigger": safeField(trigger)})
 	}
 	if partialFailure {
+		if runtimeContextErr != nil {
+			return runtimeContextErr
+		}
 		return errors.New("one or more host.auth.get_runtime callbacks failed")
 	}
 	return persistErr
 }
 
-func (m *Monitor) CheckNow(ctx context.Context) Status {
-	_ = m.Reconcile(ctx, "management")
-	return m.Snapshot()
+func (m *Monitor) CheckNow(ctx context.Context) (Status, error) {
+	err := m.Reconcile(ctx, "management")
+	return m.Snapshot(), err
 }
 
 func (m *Monitor) notificationDrainTimeout() time.Duration {
@@ -438,11 +673,14 @@ func (m *Monitor) Snapshot() Status {
 	return status
 }
 
-func (m *Monitor) ensureStateLoaded(roster []protocol.HostAuthFileEntry) {
+func (m *Monitor) ensureStateLoaded(ctx context.Context, roster []protocol.HostAuthFileEntry) (bool, error) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
+	if m.retiring.Load() || m.retired {
+		return false, ErrStopping
+	}
 	if m.stateLoaded {
-		return
+		return false, nil
 	}
 	if strings.TrimSpace(m.cfg.StateFile) == "" {
 		hasAuthPath := false
@@ -455,24 +693,52 @@ func (m *Monitor) ensureStateLoaded(roster []protocol.HostAuthFileEntry) {
 		if !hasAuthPath {
 			m.status.StateFile = ""
 			m.status.StateFileHealth = "waiting_for_auth_path"
-			return
+			return false, nil
 		}
 	}
 	m.store = state.Store{Path: state.ResolvePath(m.cfg.StateFile, roster)}
 	m.status.StateFile = m.store.Path
+
+	// A replacement monitor may encounter an old writer whose validated commit
+	// is still in flight. Bound lease acquisition by both the caller and monitor
+	// lifecycle contexts so management checks can retry and stop can detach.
+	claimCtx, cancelClaim := context.WithCancel(ctx)
+	stopClaimCancel := context.AfterFunc(m.ctx, cancelClaim)
+	err := m.store.ClaimContext(claimCtx)
+	stopClaimCancel()
+	cancelClaim()
+	if err != nil {
+		if m.ctx.Err() != nil || m.retiring.Load() || m.retired {
+			m.status.StateFileHealth = "writer_claim_stopping"
+			return false, ErrStopping
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			m.status.StateFileHealth = "writer_claim_wait_timeout"
+			return false, err
+		}
+		m.data = state.NewData()
+		m.status.StateFileHealth = "writer_claim_error_in_memory_only"
+		m.stateLoaded = true
+		return false, nil
+	}
+	if m.ctx.Err() != nil || m.retiring.Load() || m.retired {
+		m.store.Release()
+		m.status.StateFileHealth = "writer_claim_stopping"
+		return false, ErrStopping
+	}
 	data, err := m.store.Load()
 	if err != nil {
 		m.data = state.NewData()
 		m.status.StateFileHealth = "load_error_in_memory_only"
-		m.host.Log(context.Background(), "warn", "account-health state could not be loaded; starting with an empty safe state", nil)
 	} else {
 		m.data = data
 		m.status.StateFileHealth = "healthy"
 	}
 	m.stateLoaded = true
+	return err != nil, nil
 }
 
-func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation health.Observation, activeKeys map[string]struct{}, now time.Time) {
+func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation health.Observation, activeKeys map[string]struct{}, identityCounts map[string]int, now time.Time) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 	account := m.data.Accounts[snapshot.AuthKey]
@@ -483,7 +749,7 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 		account = nil
 	}
 	if account == nil {
-		if oldKey := m.correlatedKeyLocked(snapshot, activeKeys); oldKey != "" {
+		if oldKey := m.correlatedKeyLocked(snapshot, activeKeys, identityCounts); oldKey != "" {
 			account = m.data.Accounts[oldKey]
 			delete(m.data.Accounts, oldKey)
 			account.AccountKey = snapshot.AuthKey
@@ -604,7 +870,11 @@ func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation 
 	}
 }
 
-func (m *Monitor) correlateReplacementCandidates(candidates []protocol.HostAuthFileEntry, identityCounts map[string]int) {
+func identityCountKey(provider, identity string) string {
+	return strings.ToLower(strings.TrimSpace(provider)) + "\x00" + identity
+}
+
+func (m *Monitor) correlateReplacementCandidates(candidates []protocol.HostAuthFileEntry, identityCounts map[string]int, runtimeIdentities map[string]string, runtimeObserved map[string]bool) {
 	type replacementMove struct {
 		oldKey    string
 		newKey    string
@@ -619,10 +889,16 @@ func (m *Monitor) correlateReplacementCandidates(candidates []protocol.HostAuthF
 	for _, candidate := range candidates {
 		identity := health.IdentityFingerprint(candidate)
 		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		if identity == "" || identityCounts[candidate.Provider+"\x00"+identity] != 1 {
+		if identity == "" || identityCounts[identityCountKey(provider, identity)] != 1 {
 			continue
 		}
 		newKey := health.AccountKey(provider, candidate.AuthIndex)
+		if runtimeObserved[newKey] && runtimeIdentities[newKey] != "" && runtimeIdentities[newKey] != identity {
+			// A successful runtime read that contradicts the roster identity vetoes
+			// roster-only continuity. The runtime fallback may still correlate its
+			// own identity if that identity is unique across the complete scan.
+			continue
+		}
 		if current := m.data.Accounts[newKey]; current != nil && current.Provider == provider && current.Identity == identity {
 			continue
 		}
@@ -711,8 +987,8 @@ func (m *Monitor) preserveReplacementCandidate(candidate protocol.HostAuthFileEn
 	}
 }
 
-func (m *Monitor) correlatedKeyLocked(snapshot health.RuntimeSnapshot, activeKeys map[string]struct{}) string {
-	if snapshot.Identity == "" {
+func (m *Monitor) correlatedKeyLocked(snapshot health.RuntimeSnapshot, activeKeys map[string]struct{}, identityCounts map[string]int) string {
+	if snapshot.Identity == "" || identityCounts[identityCountKey(snapshot.Provider, snapshot.Identity)] != 1 {
 		return ""
 	}
 	match := ""
@@ -773,7 +1049,7 @@ func (m *Monitor) enqueueFailureLocked(account *state.Account, reminder bool, no
 		kind = "reminder"
 	}
 	generation := account.IncidentGeneration
-	if m.enqueueLocked(account, kind, generation, m.failureMessage(account, kind, now)) {
+	if m.enqueueLocked(account, kind, generation, now, m.failureMessage(account, kind, now)) {
 		account.LastAlertAttemptAt = now
 		account.LastAlertAttemptGeneration = generation
 	}
@@ -781,7 +1057,7 @@ func (m *Monitor) enqueueFailureLocked(account *state.Account, reminder bool, no
 
 func (m *Monitor) enqueueRecoveryLocked(account *state.Account, now time.Time) {
 	generation := account.IncidentGeneration
-	if m.enqueueLocked(account, "recovery", generation, m.recoveryMessage(account, now)) {
+	if m.enqueueLocked(account, "recovery", generation, now, m.recoveryMessage(account, now)) {
 		account.LastRecoveryAttemptAt = now
 	}
 }
@@ -798,14 +1074,18 @@ func (m *Monitor) enqueueInformationalLocked(account *state.Account, kind string
 		Label:      account.Label,
 		Reason:     kind,
 	}
-	m.enqueueLocked(account, kind, account.IncidentGeneration, message)
+	m.enqueueLocked(account, kind, account.IncidentGeneration, time.Time{}, message)
 }
 
-func (m *Monitor) enqueueLocked(account *state.Account, kind string, generation uint64, message notifier.Message) bool {
+func (m *Monitor) enqueueLocked(account *state.Account, kind string, generation uint64, attemptAt time.Time, message notifier.Message) bool {
+	if m.retiring.Load() || m.retired {
+		return false
+	}
 	job := notifier.Job{
 		Message:  message,
 		Valid:    m.deliveryValid(account, kind, generation),
-		Callback: m.deliveryCallback(account, kind, generation),
+		Abandon:  m.deliveryAbandon(account, kind, generation, attemptAt),
+		Callback: m.deliveryCallback(account, kind, generation, attemptAt),
 	}
 	if !m.dispatcher.Enqueue(job) {
 		m.data.LastNotificationErr = "notification queue is unavailable"
@@ -824,6 +1104,31 @@ func (m *Monitor) accountCurrentLocked(target *state.Account) bool {
 		}
 	}
 	return false
+}
+
+func (m *Monitor) deliveryAbandon(account *state.Account, kind string, generation uint64, attemptAt time.Time) func() {
+	if account == nil || attemptAt.IsZero() || generation == 0 {
+		return nil
+	}
+	rollbackKind := state.AlertSuppression
+	if kind == "recovery" {
+		rollbackKind = state.RecoverySuppression
+	} else if kind != "failure" && kind != "reminder" {
+		return nil
+	}
+	path := m.store.Path
+	accountKey := account.AccountKey
+	identity := account.Identity
+	return func() {
+		m.rollbackPending.Store(true)
+		state.RegisterSuppressionRollback(path, state.SuppressionRollback{
+			AccountKey: accountKey,
+			Identity:   identity,
+			Kind:       rollbackKind,
+			Generation: generation,
+			AttemptAt:  attemptAt,
+		})
+	}
 }
 
 func (m *Monitor) deliveryValid(account *state.Account, kind string, generation uint64) func() bool {
@@ -848,11 +1153,41 @@ func (m *Monitor) deliveryValid(account *state.Account, kind string, generation 
 	}
 }
 
-func (m *Monitor) deliveryCallback(account *state.Account, kind string, generation uint64) func(notifier.DeliveryResult) {
+func (m *Monitor) deliveryCallback(account *state.Account, kind string, generation uint64, attemptAt time.Time) func(notifier.DeliveryResult) {
 	return func(result notifier.DeliveryResult) {
 		m.stateMu.Lock()
 		defer m.stateMu.Unlock()
+		if m.retiring.Load() || m.retired {
+			return
+		}
 		current := m.accountCurrentLocked(account)
+		if result.Unattempted {
+			if !current {
+				return
+			}
+			changed := false
+			switch kind {
+			case "failure", "reminder":
+				if account.IncidentGeneration == generation && account.LastAlertAttemptGeneration == generation && account.LastAlertAttemptAt.Equal(attemptAt) {
+					account.LastAlertAttemptAt = time.Time{}
+					account.LastAlertAttemptGeneration = 0
+					changed = true
+				}
+			case "recovery":
+				if account.IncidentGeneration == generation && account.LastRecoveryAttemptAt.Equal(attemptAt) {
+					account.LastRecoveryAttemptAt = time.Time{}
+					changed = true
+				}
+			}
+			if changed {
+				// Retirement batches all unattempted marker clears into one
+				// asynchronous state write. Keeping terminal callbacks free of
+				// filesystem I/O preserves the bounded lifecycle budget.
+				m.rollbackPending.Store(true)
+				m.status.Accounts = accountStatuses(m.data, m.cfg.ReminderInterval)
+			}
+			return
+		}
 		if result.Accepted {
 			m.data.LastSuccessfulSend = result.At
 			m.data.LastNotificationErr = ""
@@ -957,6 +1292,9 @@ func (m *Monitor) recoveryMessage(account *state.Account, now time.Time) notifie
 }
 
 func (m *Monitor) persistLocked() error {
+	if m.retiring.Load() || m.retired {
+		return state.ErrWriterSuperseded
+	}
 	if !m.stateLoaded {
 		return nil
 	}
@@ -970,6 +1308,10 @@ func (m *Monitor) persistLocked() error {
 
 func (m *Monitor) recordMonitoringFailure(now time.Time, message string) {
 	m.stateMu.Lock()
+	if m.retiring.Load() || m.retired {
+		m.stateMu.Unlock()
+		return
+	}
 	m.status.LastScan = now
 	m.status.MonitoringStale = true
 	m.status.LastMonitoringError = message
@@ -978,6 +1320,10 @@ func (m *Monitor) recordMonitoringFailure(now time.Time, message string) {
 
 func (m *Monitor) setNextScan(next time.Time) {
 	m.stateMu.Lock()
+	if m.retiring.Load() || m.retired {
+		m.stateMu.Unlock()
+		return
+	}
 	m.status.NextScan = next.UTC()
 	m.stateMu.Unlock()
 }

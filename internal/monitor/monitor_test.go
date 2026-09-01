@@ -3,10 +3,12 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,6 +262,354 @@ func TestStopWaitsForBlockedHostCallback(t *testing.T) {
 	}
 }
 
+func TestBoundedStopRetiresStuckHostCallButFinalStopStillWaits(t *testing.T) {
+	host := &blockingRuntimeHost{
+		entry:   oauthEntry("one", "claude", "a@example.com", "active", "", false),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	mock := newMockPushover(t)
+	cfg := config.Default()
+	cfg.StartupGrace = 24 * time.Hour
+	cfg.ScanInterval = 24 * time.Hour
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
+	dispatcher := notifier.NewDispatcher(client, 4, 0)
+	monitor := New(cfg, host, client, dispatcher)
+	monitor.Start()
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- monitor.Reconcile(context.Background(), "blocked") }()
+	select {
+	case <-host.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime callback did not start")
+	}
+
+	if monitor.StopWithin(20 * time.Millisecond) {
+		t.Fatal("bounded stop reported a stuck host callback as drained")
+	}
+	if !monitor.isRetired() {
+		t.Fatal("bounded stop did not retire the monitor")
+	}
+	finalWaitStarted := make(chan struct{})
+	monitor.beforeFinalWait = func() { close(finalWaitStarted) }
+	finalDone := make(chan struct{})
+	go func() {
+		monitor.Stop()
+		close(finalDone)
+	}()
+	select {
+	case <-finalWaitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final stop did not reach the admitted-operation wait")
+	}
+	select {
+	case <-finalDone:
+		t.Fatal("final stop returned while the host callback was still in flight")
+	default:
+	}
+
+	close(host.release)
+	select {
+	case err := <-reconcileDone:
+		if !errors.Is(err, ErrStopping) {
+			t.Fatalf("retired reconciliation error=%v, want ErrStopping", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconciliation did not finish after host release")
+	}
+	select {
+	case <-finalDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final stop did not return after host release")
+	}
+}
+
+func TestReconcileSerializationHonorsCallerDeadline(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "active", "", false))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	monitor.reconcileMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := monitor.Reconcile(ctx, "queued-management")
+	monitor.reconcileMu.Unlock()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued reconciliation error=%v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("queued reconciliation ignored its deadline for %s", elapsed)
+	}
+}
+
+func TestReconcileSerializationStopsWithMonitorLifecycle(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "active", "", false))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	monitor.reconcileMu.Lock()
+	lockWaitStarted := make(chan struct{})
+	monitor.beforeReconcileLock = func() { close(lockWaitStarted) }
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- monitor.Reconcile(context.Background(), "queued-management") }()
+	select {
+	case <-lockWaitStarted:
+	case <-time.After(5 * time.Second):
+		monitor.reconcileMu.Unlock()
+		t.Fatal("queued reconciliation did not reach the serialization lock")
+	}
+	if !monitor.StopWithin(50 * time.Millisecond) {
+		monitor.reconcileMu.Unlock()
+		t.Fatal("bounded stop did not cancel a reconciliation waiting only for serialization")
+	}
+	select {
+	case err := <-reconcileDone:
+		if !errors.Is(err, ErrStopping) {
+			monitor.reconcileMu.Unlock()
+			t.Fatalf("queued reconciliation error=%v, want ErrStopping", err)
+		}
+	case <-time.After(5 * time.Second):
+		monitor.reconcileMu.Unlock()
+		t.Fatal("queued reconciliation did not stop with the monitor lifecycle")
+	}
+	monitor.reconcileMu.Unlock()
+}
+
+type cancellationIgnoringTransport struct {
+	started chan struct{}
+	release chan struct{}
+	body    chan string
+	once    sync.Once
+}
+
+func (t *cancellationIgnoringTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if t.body != nil {
+		raw, _ := io.ReadAll(request.Body)
+		form, _ := url.ParseQuery(string(raw))
+		t.body <- form.Get("message")
+	}
+	t.once.Do(func() { close(t.started) })
+	<-t.release
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"status":1}`)),
+		Request:    request,
+	}, nil
+}
+
+func TestRetiredMonitorCannotOverwriteReplacementStateAfterWorkerResumes(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	cfg := config.Default()
+	cfg.Enabled = true
+	cfg.StartupGrace = 24 * time.Hour
+	cfg.ScanInterval = 24 * time.Hour
+	cfg.StateFile = statePath
+	cfg.NotificationCoalesceWindow = 0
+	cfg.NotifyRecovery = false
+
+	oldHost := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	oldHost.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
+	transport := &cancellationIgnoringTransport{started: make(chan struct{}), release: make(chan struct{})}
+	oldClient := notifier.NewClient(cfg, notifier.ProductionEndpoint, &http.Client{Transport: transport})
+	oldDispatcher := notifier.NewDispatcher(oldClient, 4, 0)
+	oldMonitor := New(cfg, oldHost, oldClient, oldDispatcher)
+	oldMonitor.Start()
+	if err := oldMonitor.Reconcile(context.Background(), "old-failure"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old notifier worker did not start")
+	}
+	if !oldMonitor.StopWithin(20 * time.Millisecond) {
+		t.Fatal("bounded stop unexpectedly left a host operation in flight")
+	}
+
+	replacementHost := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	replacementHost.set(oauthEntry("one", "claude", "a@example.com", "active", "", false))
+	mock := newMockPushover(t)
+	replacementClient := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
+	replacementDispatcher := notifier.NewDispatcher(replacementClient, 4, 0)
+	replacement := New(cfg, replacementHost, replacementClient, replacementDispatcher)
+	replacement.Start()
+	defer replacement.Stop()
+	if err := replacement.Reconcile(context.Background(), "replacement-healthy"); err != nil {
+		t.Fatal(err)
+	}
+	beforeResume, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(beforeResume), `"health": "healthy"`) {
+		t.Fatalf("replacement state was not persisted: %s", beforeResume)
+	}
+
+	close(transport.release)
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+	if !oldDispatcher.WaitStopped(waitCtx) {
+		t.Fatal("old notifier worker did not finish after release")
+	}
+	afterResume, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterResume) != string(beforeResume) {
+		t.Fatalf("retired notifier worker overwrote replacement state:\nbefore=%s\nafter=%s", beforeResume, afterResume)
+	}
+	oldMonitor.Stop()
+}
+
+func TestFinalStopWaitsForCancellationIgnoringDeliveryWorker(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	cfg := config.Default()
+	cfg.Enabled = true
+	cfg.StartupGrace = 24 * time.Hour
+	cfg.ScanInterval = 24 * time.Hour
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+	cfg.NotificationCoalesceWindow = 0
+	cfg.NotifyRecovery = false
+
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
+	transport := &cancellationIgnoringTransport{started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(transport.release) }) }
+	defer release()
+	client := notifier.NewClient(cfg, notifier.ProductionEndpoint, &http.Client{Transport: transport})
+	dispatcher := notifier.NewDispatcher(client, 4, 0)
+	monitor := New(cfg, host, client, dispatcher)
+	monitor.Start()
+	if err := monitor.Reconcile(context.Background(), "failure"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery worker did not start")
+	}
+	if !monitor.StopWithin(20 * time.Millisecond) {
+		t.Fatal("bounded stop unexpectedly left a host operation in flight")
+	}
+
+	finalWaitStarted := make(chan struct{})
+	monitor.beforeFinalDispatcherWait = func() { close(finalWaitStarted) }
+	finalDone := make(chan struct{})
+	go func() {
+		monitor.Stop()
+		close(finalDone)
+	}()
+	select {
+	case <-finalWaitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final stop did not reach the delivery-worker wait")
+	}
+	select {
+	case <-finalDone:
+		t.Fatal("final stop returned while delivery code was still in flight")
+	default:
+	}
+
+	release()
+	select {
+	case <-finalDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final stop did not return after the delivery worker exited")
+	}
+}
+
+func TestBoundedStopClearsUnattemptedPartitionMarkersBeforeRetirement(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	cfg := config.Default()
+	cfg.Enabled = true
+	cfg.StartupGrace = 24 * time.Hour
+	cfg.ScanInterval = 24 * time.Hour
+	cfg.StateFile = statePath
+	cfg.NotificationCoalesceWindow = time.Hour
+
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	const accountCount = 32
+	labels := make([]string, accountCount)
+	for i := 0; i < accountCount; i++ {
+		index := fmt.Sprintf("account-%02d", i)
+		labels[i] = fmt.Sprintf("account-%02d-%s@example.com", i, strings.Repeat("x", 80))
+		entry := oauthEntry(index, "claude", labels[i], "error", "unauthorized", true)
+		host.roster = append(host.roster, entry)
+		host.runtime[index] = entry
+	}
+	transport := &cancellationIgnoringTransport{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		body:    make(chan string, 1),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(transport.release) }) }
+	defer release()
+	client := notifier.NewClient(cfg, notifier.ProductionEndpoint, &http.Client{Transport: transport})
+	dispatcher := notifier.NewDispatcher(client, 64, cfg.NotificationCoalesceWindow)
+	monitor := New(cfg, host, client, dispatcher)
+	monitor.Start()
+	if err := monitor.Reconcile(context.Background(), "oversized-failures"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first oversized notification partition did not start")
+	}
+	firstBody := <-transport.body
+	if !monitor.StopWithin(100 * time.Millisecond) {
+		t.Fatal("bounded stop unexpectedly left a host operation in flight")
+	}
+
+	loaded, err := (state.Store{Path: statePath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unattempted := 0
+	for i, label := range labels {
+		account := loaded.Accounts[health.AccountKey("claude", fmt.Sprintf("account-%02d", i))]
+		if account == nil {
+			t.Fatalf("account %d missing from persisted state", i)
+		}
+		if strings.Contains(firstBody, label) {
+			if account.LastAlertAttemptAt.IsZero() || account.LastAlertAttemptGeneration == 0 {
+				t.Fatalf("attempted partition marker was cleared for account %d: %+v", i, account)
+			}
+			continue
+		}
+		unattempted++
+		if !account.LastAlertAttemptAt.IsZero() || account.LastAlertAttemptGeneration != 0 {
+			t.Fatalf("unattempted partition retained suppression for account %d: %+v", i, account)
+		}
+	}
+	if unattempted == 0 {
+		t.Fatal("test did not create a later oversized partition")
+	}
+
+	release()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+	if !dispatcher.WaitStopped(waitCtx) {
+		t.Fatal("old dispatcher did not stop after the attempted request resumed")
+	}
+	select {
+	case body := <-transport.body:
+		t.Fatalf("canceled dispatcher sent a later partition: %s", body)
+	default:
+	}
+	monitor.Stop()
+}
+
 func TestHealthyReauthDedupeAndRecovery(t *testing.T) {
 	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
 	mock := newMockPushover(t)
@@ -488,6 +838,186 @@ func TestRejectedEnqueueDoesNotRecordNotificationAttempt(t *testing.T) {
 	}
 }
 
+func TestUnattemptedFailureClearsExactSuppressionMarker(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	cfg := config.Default()
+	cfg.Enabled = true
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+	cfg.NotificationCoalesceWindow = time.Hour
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
+	dispatcher := notifier.NewDispatcher(client, 4, cfg.NotificationCoalesceWindow)
+	monitor := New(cfg, host, client, dispatcher)
+	t.Cleanup(monitor.Stop)
+	attemptAt := time.Now().UTC()
+	monitor.now = func() time.Time { return attemptAt }
+
+	if err := monitor.Reconcile(context.Background(), "accepted-before-start"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.stateMu.RLock()
+	queued := *monitor.data.Accounts["claude:one"]
+	monitor.stateMu.RUnlock()
+	if !queued.LastAlertAttemptAt.Equal(attemptAt) || queued.LastAlertAttemptGeneration != queued.IncidentGeneration {
+		t.Fatalf("accepted job did not record its suppression marker: %+v", queued)
+	}
+
+	dispatcher.Stop()
+	monitor.stateMu.RLock()
+	account := *monitor.data.Accounts["claude:one"]
+	lastError := monitor.data.LastNotificationErr
+	monitor.stateMu.RUnlock()
+	if !account.LastAlertAttemptAt.IsZero() || account.LastAlertAttemptGeneration != 0 {
+		t.Fatalf("unattempted job retained a five-minute suppression marker: %+v", account)
+	}
+	if account.AlertSent || !account.LastAlertAt.IsZero() || lastError != "" {
+		t.Fatalf("unattempted job changed delivery state: account=%+v lastError=%q", account, lastError)
+	}
+	if mock.count() != 0 {
+		t.Fatalf("unattempted job made %d HTTP requests", mock.count())
+	}
+}
+
+func TestBoundedStopDoesNotWaitForStateLockAndCarriesAbandonmentForward(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	cfg := config.Default()
+	cfg.Enabled = true
+	cfg.StateFile = statePath
+	cfg.NotificationCoalesceWindow = time.Hour
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
+	dispatcher := notifier.NewDispatcher(client, 4, cfg.NotificationCoalesceWindow)
+	monitor := New(cfg, host, client, dispatcher)
+	attemptAt := time.Now().UTC()
+	monitor.now = func() time.Time { return attemptAt }
+	if err := monitor.Reconcile(context.Background(), "queued-before-start"); err != nil {
+		t.Fatal(err)
+	}
+
+	monitor.stateMu.Lock()
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- monitor.StopWithin(20 * time.Millisecond) }()
+	select {
+	case <-stopDone:
+	case <-time.After(500 * time.Millisecond):
+		monitor.stateMu.Unlock()
+		<-stopDone
+		t.Fatal("bounded stop waited indefinitely for the monitor state lock")
+	}
+
+	loaded, err := (state.Store{Path: statePath}).Load()
+	if err != nil {
+		monitor.stateMu.Unlock()
+		t.Fatal(err)
+	}
+	account := loaded.Accounts[health.AccountKey("claude", "one")]
+	if account == nil || !account.LastAlertAttemptAt.IsZero() || account.LastAlertAttemptGeneration != 0 {
+		monitor.stateMu.Unlock()
+		t.Fatalf("replacement load retained an abandoned suppression marker: %+v", account)
+	}
+	monitor.stateMu.Unlock()
+	monitor.Stop()
+}
+
+func TestBoundedStopDoesNotWaitForRetirementSave(t *testing.T) {
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	cfg := config.Default()
+	cfg.Enabled = true
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.json")
+	cfg.NotificationCoalesceWindow = time.Hour
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	client := notifier.NewClient(cfg, mock.endpoint, mock.server.Client())
+	dispatcher := notifier.NewDispatcher(client, 4, cfg.NotificationCoalesceWindow)
+	monitor := New(cfg, host, client, dispatcher)
+	if err := monitor.Reconcile(context.Background(), "queued-before-start"); err != nil {
+		t.Fatal(err)
+	}
+
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSave) }) }
+	defer release()
+	monitor.beforeRetirementSave = func() {
+		close(saveStarted)
+		<-releaseSave
+	}
+	stopDone := make(chan bool, 1)
+	go func() { stopDone <- monitor.StopWithin(50 * time.Millisecond) }()
+	select {
+	case <-saveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retirement save did not start")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("bounded stop waited for retirement filesystem I/O")
+	}
+	select {
+	case <-monitor.retirementDone:
+		t.Fatal("retirement completed while its save was still blocked")
+	default:
+	}
+	release()
+	monitor.Stop()
+}
+
+func TestUnattemptedCallbackClearsOnlyItsExactAttempt(t *testing.T) {
+	cfg := config.Default()
+	client := notifier.NewClient(cfg, notifier.ProductionEndpoint, nil)
+	dispatcher := notifier.NewDispatcher(client, 4, 0)
+	monitor := New(cfg, &fakeHost{}, client, dispatcher)
+	oldAttempt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	newAttempt := oldAttempt.Add(time.Minute)
+	failure := &state.Account{
+		AccountKey:                 "claude:failure",
+		Health:                     health.ReauthRequired,
+		IncidentGeneration:         4,
+		LastAlertAttemptAt:         newAttempt,
+		LastAlertAttemptGeneration: 4,
+	}
+	recovery := &state.Account{
+		AccountKey:            "claude:recovery",
+		Health:                health.Healthy,
+		IncidentGeneration:    7,
+		RecoveryPendingFrom:   health.ReauthRequired,
+		LastRecoveryAttemptAt: newAttempt,
+	}
+	monitor.data.Accounts[failure.AccountKey] = failure
+	monitor.data.Accounts[recovery.AccountKey] = recovery
+
+	monitor.deliveryCallback(failure, "failure", 3, newAttempt)(notifier.DeliveryResult{Unattempted: true})
+	monitor.deliveryCallback(recovery, "recovery", 6, newAttempt)(notifier.DeliveryResult{Unattempted: true})
+	monitor.deliveryCallback(failure, "failure", 4, oldAttempt)(notifier.DeliveryResult{Unattempted: true})
+	monitor.deliveryCallback(recovery, "recovery", 7, oldAttempt)(notifier.DeliveryResult{Unattempted: true})
+	if !failure.LastAlertAttemptAt.Equal(newAttempt) || failure.LastAlertAttemptGeneration != 4 {
+		t.Fatalf("stale failure callback cleared a newer attempt: %+v", failure)
+	}
+	if !recovery.LastRecoveryAttemptAt.Equal(newAttempt) {
+		t.Fatalf("stale recovery callback cleared a newer attempt: %+v", recovery)
+	}
+
+	monitor.deliveryCallback(failure, "failure", 4, newAttempt)(notifier.DeliveryResult{Unattempted: true})
+	monitor.deliveryCallback(recovery, "recovery", 7, newAttempt)(notifier.DeliveryResult{Unattempted: true})
+	if !failure.LastAlertAttemptAt.IsZero() || failure.LastAlertAttemptGeneration != 0 {
+		t.Fatalf("matching failure callback did not clear its attempt: %+v", failure)
+	}
+	if !recovery.LastRecoveryAttemptAt.IsZero() {
+		t.Fatalf("matching recovery callback did not clear its attempt: %+v", recovery)
+	}
+}
+
 func TestReminderOnlyAfterInterval(t *testing.T) {
 	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
 	host.set(oauthEntry("one", "claude", "a@example.com", "error", "unauthorized", true))
@@ -537,6 +1067,135 @@ func TestReplacementCorrelatesByExactEmailAndRecovers(t *testing.T) {
 	rows := monitor.Snapshot().Accounts
 	if len(rows) != 1 || rows[0].AuthIndex != "new-index" || rows[0].Health != health.Healthy {
 		t.Fatalf("replacement was not safely correlated: %+v", rows)
+	}
+}
+
+func TestReplacementUsesUniqueRuntimeIdentityWhenRosterIsLessSpecific(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("old-index", "claude", "same@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	if err := monitor.Reconcile(context.Background(), "old-failure"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
+
+	rosterEntry := oauthEntry("new-index", "claude", "", "active", "", false)
+	rosterEntry.Label = "replacement roster label"
+	runtimeEntry := rosterEntry
+	runtimeEntry.Email = "same@example.com"
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{rosterEntry}
+	host.runtime = map[string]protocol.HostAuthFileEntry{runtimeEntry.AuthIndex: runtimeEntry}
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "runtime-enriched-replacement"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 2 })
+	rows := monitor.Snapshot().Accounts
+	if len(rows) != 1 || rows[0].AuthIndex != "new-index" || rows[0].Health != health.Healthy {
+		t.Fatalf("unique runtime identity was not correlated: %+v", rows)
+	}
+}
+
+func TestRuntimeDuplicateIdentityBlocksRosterOnlyPreCorrelation(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("old-index", "claude", "same@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	if err := monitor.Reconcile(context.Background(), "old-failure"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
+
+	firstRoster := oauthEntry("new-index-a", "claude", "same@example.com", "active", "", false)
+	secondRoster := oauthEntry("new-index-b", "claude", "", "active", "", false)
+	secondRoster.Label = "less-specific-roster-entry"
+	firstRuntime := firstRoster
+	secondRuntime := secondRoster
+	secondRuntime.Email = "same@example.com"
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{firstRoster, secondRoster}
+	host.runtime = map[string]protocol.HostAuthFileEntry{
+		firstRuntime.AuthIndex:  firstRuntime,
+		secondRuntime.AuthIndex: secondRuntime,
+	}
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "runtime-duplicate-replacements"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.dispatcher.BeginDrain()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrain()
+	if !monitor.dispatcher.WaitIdle(drainCtx) {
+		t.Fatal("runtime duplicate notifications did not drain")
+	}
+
+	monitor.stateMu.RLock()
+	old := monitor.data.Accounts["claude:old-index"]
+	newA := monitor.data.Accounts["claude:new-index-a"]
+	newB := monitor.data.Accounts["claude:new-index-b"]
+	monitor.stateMu.RUnlock()
+	if old == nil || old.Health != health.Removed {
+		t.Fatalf("runtime-ambiguous prior account was not retained as removed: %+v", old)
+	}
+	if newA == nil || newA.Health != health.Healthy || newA.IncidentGeneration != 0 || newA.AlertSent {
+		t.Fatalf("roster-specific duplicate inherited prior incident state: %+v", newA)
+	}
+	if newB == nil || newB.Health != health.Healthy || newB.IncidentGeneration != 0 || newB.AlertSent {
+		t.Fatalf("runtime-enriched duplicate inherited prior incident state: %+v", newB)
+	}
+	if mock.count() != 1 {
+		t.Fatalf("runtime duplicate identity sent a spurious recovery: %s", mock.all())
+	}
+}
+
+func TestDuplicateReplacementIdentityDoesNotArbitrarilyRecover(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	host.set(oauthEntry("old-index", "claude", "same@example.com", "error", "unauthorized", true))
+	mock := newMockPushover(t)
+	monitor := newTestMonitor(t, host, mock, filepath.Join(t.TempDir(), "state.json"))
+	if err := monitor.Reconcile(context.Background(), "old-failure"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	waitFor(t, 5*time.Second, func() bool { return !monitor.Snapshot().Accounts[0].LastAlertAt.IsZero() })
+
+	first := oauthEntry("new-index-a", "claude", "same@example.com", "active", "", false)
+	second := oauthEntry("new-index-b", "claude", "same@example.com", "active", "", false)
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{first, second}
+	host.runtime[first.AuthIndex] = first
+	host.runtime[second.AuthIndex] = second
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "duplicate-replacements"); err != nil {
+		t.Fatal(err)
+	}
+	monitor.dispatcher.BeginDrain()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrain()
+	if !monitor.dispatcher.WaitIdle(drainCtx) {
+		t.Fatal("duplicate replacement notifications did not drain")
+	}
+
+	monitor.stateMu.RLock()
+	old := monitor.data.Accounts["claude:old-index"]
+	newA := monitor.data.Accounts["claude:new-index-a"]
+	newB := monitor.data.Accounts["claude:new-index-b"]
+	monitor.stateMu.RUnlock()
+	if old == nil || old.Health != health.Removed {
+		t.Fatalf("ambiguous prior account was not retained as removed: %+v", old)
+	}
+	if newA == nil || newA.Health != health.Healthy || newA.IncidentGeneration != 0 || newA.AlertSent {
+		t.Fatalf("first duplicate inherited prior incident state: %+v", newA)
+	}
+	if newB == nil || newB.Health != health.Healthy || newB.IncidentGeneration != 0 || newB.AlertSent {
+		t.Fatalf("second duplicate inherited prior incident state: %+v", newB)
+	}
+	if mock.count() != 1 {
+		t.Fatalf("ambiguous duplicate identity sent a spurious recovery: %s", mock.all())
 	}
 }
 
@@ -794,7 +1453,7 @@ func TestStaleRecoveryCannotCorruptNewFailureIncident(t *testing.T) {
 	if err := monitor.Reconcile(context.Background(), "failed-again"); err != nil {
 		t.Fatal(err)
 	}
-	monitor.deliveryCallback(account, "recovery", oldGeneration)(notifier.DeliveryResult{Accepted: true, At: current.Add(time.Second)})
+	monitor.deliveryCallback(account, "recovery", oldGeneration, time.Time{})(notifier.DeliveryResult{Accepted: true, At: current.Add(time.Second)})
 
 	waitFor(t, 15*time.Second, func() bool { return mock.count() == 2 })
 	status := monitor.Snapshot().Accounts[0]
@@ -1211,10 +1870,11 @@ func TestLoopRunsStartupAndPeriodicReconciliations(t *testing.T) {
 		defer host.mu.Unlock()
 		return host.listCalls >= 3
 	})
-	status := monitor.Snapshot()
-	if status.LastScan.IsZero() || status.NextScan.IsZero() || !status.NextScan.After(status.LastScan) {
-		t.Fatalf("periodic loop did not publish scan timing: %+v", status)
-	}
+	var status Status
+	waitFor(t, 5*time.Second, func() bool {
+		status = monitor.Snapshot()
+		return !status.LastScan.IsZero() && !status.NextScan.IsZero() && status.NextScan.After(status.LastScan)
+	})
 	if mock.count() != 0 {
 		t.Fatalf("healthy periodic scans sent notifications: %s", mock.all())
 	}

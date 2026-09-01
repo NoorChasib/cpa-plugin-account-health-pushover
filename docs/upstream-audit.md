@@ -65,6 +65,14 @@ host.log
 
 `host.auth.get_runtime` request is `{"auth_index":"..."}` and returns `{"auth":{...}}`.
 
+### Synchronous callback cancellation limitation
+
+At the audited commit, the host callback ABI invokes the host function pointer synchronously (`internal/pluginhost/host_callbacks_unix.go:43-44`). The auth callback dispatch and handlers do not carry plugin cancellation through the operation; the relevant paths use `context.Background()` or otherwise continue independently of the plugin's canceled context (`internal/pluginhost/auth_callbacks.go:53-96` and `internal/pluginhost/auth_callbacks.go:446-458`). Once a plugin goroutine has entered `C.call_host_api`, plugin-side context cancellation therefore cannot interrupt that callback.
+
+This implementation bounds reconfigure and quiesce by closing old-monitor admission, canceling its context, retiring its notification and state-writer authority, and detaching it if an admitted callback does not return within the lifecycle budget. A replacement monitor can then start without waiting indefinitely for the old synchronous call. Final native shutdown intentionally remains unbounded: `cliproxy_plugin_shutdown` joins admitted host callbacks, cancellation-ignoring delivery workers, and retirement persistence/release work before returning, and it never clears the stored host API while any admitted callback is still in flight. Waiting is safer than unloading the shared object or releasing the host callback table while plugin-owned native or Go code remains live.
+
+A complete fix for the callback limitation requires upstream support for cancellable host callbacks or documented, enforced host-side hard timeouts. Until then, bounded detachment protects reconfigure/quiesce availability, while the unbounded final shutdown joins all plugin-owned work required for native unload safety.
+
 The current `HostAuthFileEntry` safely exposes the fields used here:
 
 ```text

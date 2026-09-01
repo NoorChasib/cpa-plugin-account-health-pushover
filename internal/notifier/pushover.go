@@ -34,9 +34,10 @@ type Message struct {
 }
 
 type DeliveryResult struct {
-	Accepted bool
-	At       time.Time
-	Error    string
+	Accepted    bool
+	Unattempted bool
+	At          time.Time
+	Error       string
 }
 
 type Status struct {
@@ -207,10 +208,22 @@ func (c *Client) record(result DeliveryResult, remaining string) {
 	}
 }
 
+type dispatchState struct {
+	attempted        bool
+	resolving        bool
+	abandonmentState uint8
+	done             chan struct{}
+}
+
 type Job struct {
-	Message  Message
-	Valid    func() bool
+	Message Message
+	Valid   func() bool
+	// Abandon is a nonblocking, idempotent internal bookkeeping hook. It is
+	// completed before stop-side retirement and before an unattempted job's
+	// validity check. A stop racing an already-running hook may invoke it again.
+	Abandon  func()
 	Callback func(DeliveryResult)
+	state    *dispatchState
 }
 
 // defaultStopTimeout bounds how long Stop waits for the delivery worker to
@@ -229,13 +242,21 @@ type Dispatcher struct {
 	stopTimeout    time.Duration
 	dropped        atomic.Uint64
 
-	stateMu   sync.Mutex
-	accepting bool
-	started   bool
-	pending   int
-	idle      chan struct{}
-	flush     chan struct{}
-	flushOnce sync.Once
+	stopMu                 sync.Mutex
+	stateMu                sync.Mutex
+	resolverWG             sync.WaitGroup
+	accepting              bool
+	started                bool
+	stopping               bool
+	pending                int
+	pendingJobs            map[*dispatchState]Job
+	idle                   chan struct{}
+	flush                  chan struct{}
+	flushOnce              sync.Once
+	collectStarted         func()
+	beforeMarkAttempted    func()
+	beforeAbandon          func()
+	beforeUnattemptedClaim func()
 }
 
 func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) *Dispatcher {
@@ -254,6 +275,7 @@ func NewDispatcher(client *Client, queueSize int, coalesceWindow time.Duration) 
 		done:           make(chan struct{}),
 		stopTimeout:    defaultStopTimeout,
 		accepting:      true,
+		pendingJobs:    make(map[*dispatchState]Job),
 		idle:           idle,
 		flush:          make(chan struct{}),
 	}
@@ -286,20 +308,101 @@ func (d *Dispatcher) BeginDrain() {
 // Stop's caller needs, cannot start new deliveries, and exits on its own once
 // its blocking call returns.
 func (d *Dispatcher) Stop() {
-	d.BeginDrain()
-	d.cancel()
-	d.stateMu.Lock()
-	started := d.started
-	d.stateMu.Unlock()
-	if !started {
-		d.abandonQueued()
+	d.StopWithin(d.stopTimeout)
+}
+
+func (d *Dispatcher) StopWithin(timeout time.Duration) {
+	d.stopMu.Lock()
+	defer d.stopMu.Unlock()
+	deadline := time.Now().Add(timeout)
+	jobs, started := d.beginStop()
+	d.abandonJobsAsync(jobs)
+	d.discardQueue()
+	if timeout <= 0 || !d.waitJobsUntil(jobs, deadline) {
 		return
 	}
-	timer := time.NewTimer(d.stopTimeout)
+	if started {
+		d.waitUntil(d.done, deadline)
+	}
+}
+
+// StopAndWait performs the final, unbounded worker join required before native
+// code can be unloaded. Bounded lifecycle paths use StopWithin and retain the
+// dispatcher for this final join when a delivery ignores cancellation.
+func (d *Dispatcher) StopAndWait() {
+	d.stopMu.Lock()
+	defer d.stopMu.Unlock()
+	jobs, started := d.beginStop()
+	d.abandonJobsAsync(jobs)
+	d.discardQueue()
+	for _, job := range jobs {
+		<-job.state.done
+	}
+	if started {
+		<-d.done
+	}
+	d.stateMu.Lock()
+	idle := d.idle
+	d.stateMu.Unlock()
+	<-idle
+	d.resolverWG.Wait()
+}
+
+func (d *Dispatcher) beginStop() ([]Job, bool) {
+	d.BeginDrain()
+	d.stateMu.Lock()
+	d.stopping = true
+	d.cancel()
+	jobs := make([]Job, 0, len(d.pendingJobs))
+	abandonments := make([]Job, 0, len(d.pendingJobs))
+	for state, job := range d.pendingJobs {
+		if state.attempted {
+			continue
+		}
+		jobs = append(jobs, job)
+		if state.abandonmentState < 2 {
+			if state.abandonmentState == 0 {
+				state.abandonmentState = 1
+			}
+			// State 1 may belong to a preempted worker. Re-running the
+			// idempotent hook here guarantees completion before retirement.
+			abandonments = append(abandonments, job)
+		}
+	}
+	started := d.started
+	d.stateMu.Unlock()
+	for _, job := range abandonments {
+		d.completeAbandonment(job)
+	}
+	return jobs, started
+}
+
+func (d *Dispatcher) waitJobsUntil(jobs []Job, deadline time.Time) bool {
+	for _, job := range jobs {
+		if !d.waitUntil(job.state.done, deadline) {
+			return false
+		}
+	}
+	return true
+}
+
+func (d *Dispatcher) waitUntil(done <-chan struct{}, deadline time.Time) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 	select {
-	case <-d.done:
+	case <-done:
+		return true
 	case <-timer.C:
+		return false
 	}
 }
 
@@ -311,17 +414,28 @@ func (d *Dispatcher) Enqueue(job Job) bool {
 		d.updateQueueStatus()
 		return false
 	}
+	job.state = &dispatchState{done: make(chan struct{})}
 	select {
 	case d.queue <- job:
 		if d.pending == 0 {
 			d.idle = make(chan struct{})
 		}
 		d.pending++
+		d.pendingJobs[job.state] = job
 		d.updateQueueStatus()
 		return true
 	default:
 		d.dropped.Add(1)
 		d.updateQueueStatus()
+		return false
+	}
+}
+
+func (d *Dispatcher) WaitStopped(ctx context.Context) bool {
+	select {
+	case <-d.done:
+		return true
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -338,30 +452,134 @@ func (d *Dispatcher) WaitIdle(ctx context.Context) bool {
 	}
 }
 
-func (d *Dispatcher) finishJobs(count int) {
-	if count <= 0 {
-		return
+func (d *Dispatcher) resolve(job Job, result DeliveryResult, callback bool) bool {
+	if !d.claimResolution(job, false) {
+		return false
+	}
+	defer d.finishResolution(job)
+	if callback && job.Callback != nil {
+		job.Callback(result)
+	}
+	return true
+}
+
+func (d *Dispatcher) claimResolution(job Job, unattempted bool) bool {
+	if job.state == nil {
+		return false
 	}
 	d.stateMu.Lock()
-	if count > d.pending {
-		count = d.pending
+	defer d.stateMu.Unlock()
+	if _, pending := d.pendingJobs[job.state]; !pending || job.state.resolving || (unattempted && job.state.attempted) {
+		return false
 	}
-	if count == 0 {
-		d.stateMu.Unlock()
-		return
-	}
-	d.pending -= count
-	if d.pending == 0 {
-		close(d.idle)
+	job.state.resolving = true
+	return true
+}
+
+func (d *Dispatcher) finishResolution(job Job) {
+	d.stateMu.Lock()
+	if _, pending := d.pendingJobs[job.state]; pending {
+		delete(d.pendingJobs, job.state)
+		if d.pending > 0 {
+			d.pending--
+		}
+		close(job.state.done)
+		if d.pending == 0 {
+			close(d.idle)
+		}
 	}
 	d.stateMu.Unlock()
 }
 
-func (d *Dispatcher) abandonQueued() {
+func (d *Dispatcher) isPending(job Job) bool {
+	if job.state == nil {
+		return false
+	}
+	d.stateMu.Lock()
+	_, pending := d.pendingJobs[job.state]
+	pending = pending && !job.state.resolving
+	d.stateMu.Unlock()
+	return pending
+}
+
+func (d *Dispatcher) noteAbandonment(job Job) {
+	if job.state == nil {
+		return
+	}
+	d.stateMu.Lock()
+	_, pending := d.pendingJobs[job.state]
+	if !pending || job.state.attempted || job.state.abandonmentState != 0 {
+		d.stateMu.Unlock()
+		return
+	}
+	job.state.abandonmentState = 1
+	d.stateMu.Unlock()
+	if d.beforeAbandon != nil {
+		d.beforeAbandon()
+	}
+	d.completeAbandonment(job)
+}
+
+func (d *Dispatcher) completeAbandonment(job Job) {
+	if job.Abandon != nil {
+		job.Abandon()
+	}
+	d.stateMu.Lock()
+	if job.state != nil && job.state.abandonmentState != 2 {
+		job.state.abandonmentState = 2
+	}
+	d.stateMu.Unlock()
+}
+
+func (d *Dispatcher) resolveUnattempted(job Job) {
+	d.noteAbandonment(job)
+	if d.beforeUnattemptedClaim != nil {
+		d.beforeUnattemptedClaim()
+	}
+	if !d.claimResolution(job, true) {
+		return
+	}
+	defer d.finishResolution(job)
+	valid := job.Valid == nil || job.Valid()
+	if valid && job.Callback != nil {
+		job.Callback(DeliveryResult{Unattempted: true})
+	}
+}
+
+func (d *Dispatcher) abandonJobs(jobs []Job) {
+	for _, job := range jobs {
+		d.resolveUnattempted(job)
+	}
+}
+
+func (d *Dispatcher) abandonJobsAsync(jobs []Job) {
+	d.resolverWG.Add(len(jobs))
+	for _, job := range jobs {
+		job := job
+		go func() {
+			defer d.resolverWG.Done()
+			d.resolveUnattempted(job)
+		}()
+	}
+}
+
+func (d *Dispatcher) abandonUnattempted() {
+	d.stateMu.Lock()
+	jobs := make([]Job, 0, len(d.pendingJobs))
+	for state, job := range d.pendingJobs {
+		if !state.attempted {
+			jobs = append(jobs, job)
+		}
+	}
+	d.stateMu.Unlock()
+	d.abandonJobs(jobs)
+}
+
+func (d *Dispatcher) drainQueue() {
 	for {
 		select {
-		case <-d.queue:
-			d.finishJobs(1)
+		case job := <-d.queue:
+			d.resolveUnattempted(job)
 		default:
 			d.updateQueueStatus()
 			return
@@ -369,24 +587,71 @@ func (d *Dispatcher) abandonQueued() {
 	}
 }
 
+func (d *Dispatcher) discardQueue() {
+	for {
+		select {
+		case <-d.queue:
+		default:
+			d.updateQueueStatus()
+			return
+		}
+	}
+}
+
+func (d *Dispatcher) validPending(jobs []Job) []Job {
+	valid := make([]Job, 0, len(jobs))
+	for _, job := range jobs {
+		if !d.isPending(job) {
+			continue
+		}
+		if job.Valid != nil && !job.Valid() {
+			d.noteAbandonment(job)
+			d.resolve(job, DeliveryResult{}, false)
+			continue
+		}
+		valid = append(valid, job)
+	}
+	return valid
+}
+
+func (d *Dispatcher) markAttempted(jobs []Job) []Job {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if d.stopping || d.ctx.Err() != nil {
+		return nil
+	}
+	attempted := make([]Job, 0, len(jobs))
+	for _, job := range jobs {
+		if _, pending := d.pendingJobs[job.state]; !pending || job.state.attempted || job.state.resolving {
+			continue
+		}
+		job.state.attempted = true
+		attempted = append(attempted, job)
+	}
+	return attempted
+}
+
 func (d *Dispatcher) run() {
 	defer close(d.done)
 	for {
 		select {
 		case <-d.ctx.Done():
-			d.abandonQueued()
+			d.abandonUnattempted()
+			d.drainQueue()
 			return
 		case first := <-d.queue:
 			batch, ok := d.collect(first)
 			if !ok {
-				d.finishJobs(len(batch))
-				d.abandonQueued()
+				d.abandonJobs(batch)
+				d.abandonUnattempted()
+				d.drainQueue()
 				return
 			}
 			d.updateQueueStatus()
 			d.deliverBatch(d.ctx, batch)
 			if d.ctx.Err() != nil {
-				d.abandonQueued()
+				d.abandonUnattempted()
+				d.drainQueue()
 				return
 			}
 		}
@@ -398,6 +663,9 @@ func (d *Dispatcher) run() {
 // abandoned undelivered.
 func (d *Dispatcher) collect(first Job) ([]Job, bool) {
 	batch := []Job{first}
+	if d.collectStarted != nil {
+		d.collectStarted()
+	}
 	if d.coalesceWindow <= 0 {
 		return batch, true
 	}
@@ -425,65 +693,62 @@ func (d *Dispatcher) collect(first Job) ([]Job, bool) {
 // retry backoff. The interrupted group's callbacks still receive the final
 // (canceled) result; groups not yet started are abandoned.
 func (d *Dispatcher) deliverBatch(parent context.Context, batch []Job) {
-	defer d.finishJobs(len(batch))
 	groups := make(map[string][]Job)
 	order := make([]string, 0)
-	for _, job := range batch {
-		if job.Valid != nil && !job.Valid() {
-			continue
-		}
+	for _, job := range d.validPending(batch) {
 		key := job.Message.Kind + "|" + strconv.Itoa(job.Message.Priority)
 		if _, exists := groups[key]; !exists {
 			order = append(order, key)
 		}
 		groups[key] = append(groups[key], job)
 	}
-	for _, key := range order {
+	abandonGroups := func(keys []string) {
+		for _, key := range keys {
+			d.abandonJobs(groups[key])
+		}
+	}
+	for groupIndex, key := range order {
 		if parent.Err() != nil {
+			abandonGroups(order[groupIndex:])
 			return
 		}
-		jobs := groups[key]
-		stillValid := jobs[:0]
-		for _, job := range jobs {
-			if job.Valid == nil || job.Valid() {
-				stillValid = append(stillValid, job)
-			}
-		}
-		jobs = stillValid
+		jobs := d.validPending(groups[key])
 		if len(jobs) == 0 {
 			continue
 		}
 
-		coalesced := len(jobs) > 1
 		messageGroups := [][]Job{jobs}
-		if coalesced {
+		if len(jobs) > 1 {
 			messageGroups = splitCoalescedJobs(jobs)
 		}
-		for _, messageJobs := range messageGroups {
+		for messageIndex, messageJobs := range messageGroups {
 			if parent.Err() != nil {
+				for _, remaining := range messageGroups[messageIndex:] {
+					d.abandonJobs(remaining)
+				}
+				abandonGroups(order[groupIndex+1:])
 				return
 			}
-			stillValid = messageJobs[:0]
-			for _, job := range messageJobs {
-				if job.Valid == nil || job.Valid() {
-					stillValid = append(stillValid, job)
-				}
+			messageJobs = d.validPending(messageJobs)
+			if len(messageJobs) == 0 {
+				continue
 			}
-			messageJobs = stillValid
+			if d.beforeMarkAttempted != nil {
+				d.beforeMarkAttempted()
+			}
+			messageJobs = d.markAttempted(messageJobs)
 			if len(messageJobs) == 0 {
 				continue
 			}
 			message := messageJobs[0].Message
-			if coalesced {
+			if len(messageJobs) > 1 {
 				message = coalescedMessage(messageJobs)
 			}
 			ctx, cancel := context.WithTimeout(parent, d.client.DeliveryTimeout())
 			result := d.client.Send(ctx, message)
 			cancel()
 			for _, job := range messageJobs {
-				if job.Callback != nil {
-					job.Callback(result)
-				}
+				d.resolve(job, result, true)
 			}
 		}
 	}

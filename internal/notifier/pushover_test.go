@@ -482,6 +482,95 @@ func TestDispatcherSplitsOversizedCoalescedGroupsAndScopesCallbacks(t *testing.T
 	}
 }
 
+func TestDispatcherReportsUnattemptedJobsWhenSplitDrainIsInterrupted(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	requestStarted := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	defer close(handlerRelease)
+	var requestMu sync.Mutex
+	var requestBodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		requestMu.Lock()
+		requestBodies = append(requestBodies, r.PostForm.Get("message"))
+		requestMu.Unlock()
+		select {
+		case <-requestStarted:
+		default:
+			close(requestStarted)
+		}
+		select {
+		case <-r.Context().Done():
+		case <-handlerRelease:
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(cfg, server.URL, &http.Client{})
+	dispatcher := NewDispatcher(client, 64, time.Hour)
+	dispatcher.Start()
+
+	const jobCount = 32
+	labels := make([]string, jobCount)
+	results := make([]DeliveryResult, jobCount)
+	callbackCounts := make([]int, jobCount)
+	done := make(chan int, jobCount)
+	for i := 0; i < jobCount; i++ {
+		i := i
+		labels[i] = fmt.Sprintf("account-%02d-%s", i, strings.Repeat("x", 100))
+		if !dispatcher.Enqueue(Job{
+			Message: Message{Kind: "failure", Priority: 1, Provider: "Claude", Label: labels[i], Reason: strings.Repeat("r", 80)},
+			Callback: func(result DeliveryResult) {
+				results[i] = result
+				callbackCounts[i]++
+				done <- i
+			},
+		}) {
+			t.Fatalf("could not enqueue job %d", i)
+		}
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first oversized partition did not start")
+	}
+	dispatcher.Stop()
+
+	for range jobCount {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("accepted valid jobs did not all receive a terminal result")
+		}
+	}
+	requestMu.Lock()
+	gotBodies := append([]string(nil), requestBodies...)
+	requestMu.Unlock()
+	if len(gotBodies) != 1 {
+		t.Fatalf("interrupted delivery made %d HTTP requests, want one", len(gotBodies))
+	}
+	firstBody := gotBodies[0]
+	unattempted := 0
+	for i, label := range labels {
+		if callbackCounts[i] != 1 {
+			t.Fatalf("job %d callback count=%d, want exactly one", i, callbackCounts[i])
+		}
+		if strings.Contains(firstBody, label) {
+			if results[i].Unattempted {
+				t.Fatalf("job %d began the HTTP attempt but was reported unattempted", i)
+			}
+			continue
+		}
+		unattempted++
+		if !results[i].Unattempted || results[i].Accepted || !results[i].At.IsZero() || results[i].Error != "" {
+			t.Fatalf("unsent job %d result=%+v", i, results[i])
+		}
+	}
+	if unattempted == 0 {
+		t.Fatal("test batch did not create a later oversized partition")
+	}
+}
+
 func TestDispatcherRevalidatesEachSplitGroupBeforeSending(t *testing.T) {
 	cfg := configuredTestConfig(t)
 	var requestMu sync.Mutex
@@ -552,6 +641,102 @@ func TestDispatcherRevalidatesEachSplitGroupBeforeSending(t *testing.T) {
 	}
 	if got := callbacks[jobCount-1].Load(); got != 0 {
 		t.Fatalf("invalidated split job callback count=%d, want zero", got)
+	}
+}
+
+func TestDispatcherReportsLaterKindAndPriorityGroupsUnattempted(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	requestStarted := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	var calls atomic.Int32
+	var startOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		calls.Add(1)
+		startOnce.Do(func() { close(requestStarted) })
+		select {
+		case <-r.Context().Done():
+		case <-handlerRelease:
+		}
+	}))
+	defer func() {
+		close(handlerRelease)
+		server.Close()
+	}()
+	client := NewClient(cfg, server.URL, &http.Client{})
+	dispatcher := NewDispatcher(client, 4, time.Hour)
+	dispatcher.Start()
+	results := make([]DeliveryResult, 3)
+	callbackCounts := make([]atomic.Int32, 3)
+	done := make(chan int, 3)
+	messages := []Message{
+		{Kind: "failure", Priority: 1, Body: "first"},
+		{Kind: "recovery", Priority: 0, Body: "second"},
+		{Kind: "failure", Priority: 0, Body: "third"},
+	}
+	for i, message := range messages {
+		i := i
+		if !dispatcher.Enqueue(Job{Message: message, Callback: func(result DeliveryResult) { results[i] = result; callbackCounts[i].Add(1); done <- i }}) {
+			t.Fatalf("could not enqueue job %d", i)
+		}
+	}
+	dispatcher.BeginDrain()
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first kind/priority group did not start")
+	}
+	dispatcher.Stop()
+	for range messages {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("kind/priority group did not receive a terminal result")
+		}
+	}
+	if results[0].Unattempted {
+		t.Fatalf("started group was reported unattempted: %+v", results[0])
+	}
+	for i := 1; i < len(results); i++ {
+		if !results[i].Unattempted || results[i].Accepted || !results[i].At.IsZero() || results[i].Error != "" {
+			t.Fatalf("later group %d result=%+v", i, results[i])
+		}
+	}
+	for i := range callbackCounts {
+		if callbackCounts[i].Load() != 1 {
+			t.Fatalf("group %d callback count=%d, want exactly one", i, callbackCounts[i].Load())
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("canceled dispatcher made %d HTTP requests, want one", calls.Load())
+	}
+}
+
+func TestDispatcherStopWhileCollectingReportsAcceptedJobUnattempted(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, time.Hour)
+	collectStarted := make(chan struct{})
+	dispatcher.collectStarted = func() { close(collectStarted) }
+	dispatcher.Start()
+	result := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "collecting"}, Callback: func(delivery DeliveryResult) { result <- delivery }}) {
+		t.Fatal("could not enqueue collecting job")
+	}
+	select {
+	case <-collectStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatcher did not enter coalescing collection")
+	}
+
+	dispatcher.Stop()
+	select {
+	case delivery := <-result:
+		if !delivery.Unattempted || delivery.Accepted || !delivery.At.IsZero() || delivery.Error != "" {
+			t.Fatalf("collecting job result=%+v", delivery)
+		}
+	default:
+		t.Fatal("accepted collecting job received no terminal result")
 	}
 }
 
@@ -669,6 +854,230 @@ func TestDispatcherStopCancelsRetryBackoff(t *testing.T) {
 	}
 }
 
+func TestDispatcherStopWithinBoundsCallbackCompletionAndIdle(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, 0)
+	callbackStarted := make(chan struct{})
+	callbackRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(callbackRelease) }) }
+	defer release()
+	result := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{
+		Message: Message{Body: "queued"},
+		Callback: func(delivery DeliveryResult) {
+			close(callbackStarted)
+			<-callbackRelease
+			result <- delivery
+		},
+	}) {
+		t.Fatal("could not enqueue queued job")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		dispatcher.StopWithin(20 * time.Millisecond)
+		close(stopDone)
+	}()
+	select {
+	case <-callbackStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unattempted callback did not start")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bounded stop hung behind callback completion")
+	}
+	idleCtx, cancelIdle := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelIdle()
+	if dispatcher.WaitIdle(idleCtx) {
+		t.Fatal("dispatcher reported idle before the terminal callback completed")
+	}
+
+	release()
+	select {
+	case delivery := <-result:
+		if !delivery.Unattempted {
+			t.Fatalf("queued delivery result=%+v, want unattempted", delivery)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal callback did not complete after release")
+	}
+	idleCtx, cancelIdle = context.WithTimeout(context.Background(), time.Second)
+	defer cancelIdle()
+	if !dispatcher.WaitIdle(idleCtx) {
+		t.Fatal("dispatcher did not become idle after callback completion")
+	}
+}
+
+func TestDispatcherFinalStopJoinsLosingUnattemptedResolver(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, 0)
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "queued"}}) {
+		t.Fatal("could not enqueue queued job")
+	}
+	dispatcher.stateMu.Lock()
+	var accepted Job
+	for _, job := range dispatcher.pendingJobs {
+		accepted = job
+		break
+	}
+	dispatcher.stateMu.Unlock()
+	if accepted.state == nil {
+		t.Fatal("accepted job was not registered")
+	}
+
+	claimPaused := make(chan struct{})
+	releaseResolver := make(chan struct{})
+	var pauseOnce sync.Once
+	dispatcher.beforeUnattemptedClaim = func() {
+		pauseOnce.Do(func() {
+			close(claimPaused)
+			<-releaseResolver
+		})
+	}
+	dispatcher.StopWithin(0)
+	select {
+	case <-claimPaused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unattempted resolver did not reach its claim boundary")
+	}
+	if !dispatcher.resolve(accepted, DeliveryResult{}, false) {
+		t.Fatal("competing resolver did not complete the accepted job")
+	}
+
+	finalDone := make(chan struct{})
+	go func() {
+		dispatcher.StopAndWait()
+		close(finalDone)
+	}()
+	select {
+	case <-finalDone:
+		t.Fatal("final stop returned while a losing resolver goroutine was live")
+	default:
+	}
+	close(releaseResolver)
+	select {
+	case <-finalDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final stop did not return after the losing resolver exited")
+	}
+}
+
+func TestDispatcherStopCompletesAbandonmentClaimedByPreemptedWorker(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, 0)
+	abandonClaimed := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseWorker) }) }
+	defer release()
+	dispatcher.beforeAbandon = func() {
+		select {
+		case <-abandonClaimed:
+		default:
+			close(abandonClaimed)
+			<-releaseWorker
+		}
+	}
+	var abandonCalls atomic.Int32
+	abandonCalled := make(chan struct{}, 2)
+	callbackCalled := make(chan struct{}, 1)
+	dispatcher.Start()
+	if !dispatcher.Enqueue(Job{
+		Message: Message{Body: "invalid"},
+		Valid:   func() bool { return false },
+		Abandon: func() {
+			abandonCalls.Add(1)
+			abandonCalled <- struct{}{}
+		},
+		Callback: func(DeliveryResult) { callbackCalled <- struct{}{} },
+	}) {
+		t.Fatal("could not enqueue invalid job")
+	}
+	select {
+	case <-abandonClaimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not claim abandonment bookkeeping")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		dispatcher.StopWithin(50 * time.Millisecond)
+		close(stopDone)
+	}()
+	select {
+	case <-abandonCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not complete the preempted abandonment hook")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("bounded stop waited for the preempted worker")
+	}
+	select {
+	case <-callbackCalled:
+		t.Fatal("invalid job received a terminal callback")
+	default:
+	}
+
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !dispatcher.WaitStopped(ctx) {
+		t.Fatal("worker did not exit after release")
+	}
+	if abandonCalls.Load() < 1 {
+		t.Fatal("abandonment bookkeeping was not invoked")
+	}
+}
+
+func TestDispatcherCancellationBeforeAttemptReportsUnattempted(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"status":1}`)
+	}))
+	defer server.Close()
+	client := NewClient(cfg, server.URL, server.Client())
+	dispatcher := NewDispatcher(client, 4, 0)
+	beforeAttempt := make(chan struct{})
+	releaseAttempt := make(chan struct{})
+	dispatcher.beforeMarkAttempted = func() {
+		close(beforeAttempt)
+		<-releaseAttempt
+	}
+	dispatcher.Start()
+	result := make(chan DeliveryResult, 1)
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "cancel before attempt"}, Callback: func(delivery DeliveryResult) { result <- delivery }}) {
+		t.Fatal("could not enqueue job")
+	}
+	select {
+	case <-beforeAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatcher did not reach the attempt boundary")
+	}
+	dispatcher.cancel()
+	close(releaseAttempt)
+	select {
+	case delivery := <-result:
+		if !delivery.Unattempted || delivery.Accepted || delivery.Error != "" {
+			t.Fatalf("canceled pre-attempt delivery result=%+v", delivery)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled pre-attempt delivery received no terminal result")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("canceled pre-attempt delivery made %d HTTP requests", calls.Load())
+	}
+}
+
 func TestDispatcherStopIsBoundedWhenDeliveryIgnoresCancellation(t *testing.T) {
 	cfg := configuredTestConfig(t)
 	transport := &failingRoundTripper{}
@@ -715,6 +1124,121 @@ func TestDispatcherStopIsBoundedWhenDeliveryIgnoresCancellation(t *testing.T) {
 	case <-dispatcher.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("abandoned worker did not exit once its blocking call returned")
+	}
+}
+
+func TestDispatcherStopBeforeStartReportsValidQueuedJobsUnattempted(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	client := NewClient(cfg, ProductionEndpoint, nil)
+	dispatcher := NewDispatcher(client, 4, 0)
+	validResult := make(chan DeliveryResult, 1)
+	invalidCallback := make(chan struct{}, 1)
+	var invalidAbandon atomic.Int32
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "valid"}, Callback: func(result DeliveryResult) { validResult <- result }}) {
+		t.Fatal("could not enqueue valid job")
+	}
+	if !dispatcher.Enqueue(Job{
+		Message:  Message{Body: "invalid"},
+		Valid:    func() bool { return false },
+		Abandon:  func() { invalidAbandon.Add(1) },
+		Callback: func(DeliveryResult) { invalidCallback <- struct{}{} },
+	}) {
+		t.Fatal("could not enqueue invalid job")
+	}
+
+	dispatcher.Stop()
+	select {
+	case result := <-validResult:
+		if !result.Unattempted || result.Accepted || !result.At.IsZero() || result.Error != "" {
+			t.Fatalf("valid unsent result=%+v", result)
+		}
+	default:
+		t.Fatal("valid queued job received no terminal result")
+	}
+	select {
+	case <-invalidCallback:
+		t.Fatal("invalid queued job received a callback")
+	default:
+	}
+	if invalidAbandon.Load() != 1 {
+		t.Fatalf("invalid queued job abandonment count=%d, want exactly one", invalidAbandon.Load())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !dispatcher.WaitIdle(ctx) {
+		t.Fatal("dispatcher did not become idle after abandoning queued jobs")
+	}
+}
+
+func TestDispatcherReportsQueueBehindCancellationIgnoringWorkerUnattempted(t *testing.T) {
+	cfg := configuredTestConfig(t)
+	transport := &failingRoundTripper{}
+	client := NewClient(cfg, ProductionEndpoint, &http.Client{Transport: transport})
+	sleeping := make(chan struct{})
+	stuck := make(chan struct{})
+	var sleepOnce sync.Once
+	client.sleep = func(context.Context, time.Duration) error {
+		sleepOnce.Do(func() { close(sleeping) })
+		<-stuck
+		return nil
+	}
+	dispatcher := NewDispatcher(client, 4, 0)
+	dispatcher.stopTimeout = 20 * time.Millisecond
+	dispatcher.Start()
+	firstResult := make(chan DeliveryResult, 1)
+	queuedResult := make(chan DeliveryResult, 1)
+	var queuedCallbacks atomic.Int32
+	invalidCallback := make(chan struct{}, 1)
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "stuck"}, Callback: func(result DeliveryResult) { firstResult <- result }}) {
+		t.Fatal("could not enqueue stuck job")
+	}
+	select {
+	case <-sleeping:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first job did not enter cancellation-ignoring backoff")
+	}
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "queued"}, Callback: func(result DeliveryResult) { queuedCallbacks.Add(1); queuedResult <- result }}) {
+		t.Fatal("could not enqueue job behind stuck worker")
+	}
+	if !dispatcher.Enqueue(Job{Message: Message{Body: "invalid"}, Valid: func() bool { return false }, Callback: func(DeliveryResult) { invalidCallback <- struct{}{} }}) {
+		t.Fatal("could not enqueue invalid job behind stuck worker")
+	}
+
+	dispatcher.Stop()
+	select {
+	case result := <-queuedResult:
+		if !result.Unattempted || result.Accepted || !result.At.IsZero() || result.Error != "" {
+			t.Fatalf("queued job result=%+v", result)
+		}
+	default:
+		t.Fatal("bounded stop did not resolve queued work before the stuck worker resumed")
+	}
+	close(stuck)
+	select {
+	case result := <-firstResult:
+		if result.Unattempted {
+			t.Fatalf("started job was reported unattempted: %+v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("started job did not finish after worker release")
+	}
+	select {
+	case <-invalidCallback:
+		t.Fatal("invalid queued job received a callback")
+	default:
+	}
+	select {
+	case <-dispatcher.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("released dispatcher worker did not exit")
+	}
+	if queuedCallbacks.Load() != 1 {
+		t.Fatalf("queued callback count=%d, want exactly one", queuedCallbacks.Load())
+	}
+	select {
+	case result := <-queuedResult:
+		t.Fatalf("queued job received a duplicate result: %+v", result)
+	default:
 	}
 }
 

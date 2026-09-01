@@ -1,7 +1,9 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -52,6 +54,307 @@ func TestStoreAtomicRoundTripAndPermissions(t *testing.T) {
 	account := loaded.Accounts["claude:one"]
 	if account == nil || !account.AlertSent || !account.LastAlertAt.Equal(now.Add(time.Second)) {
 		t.Fatalf("round-trip lost dedupe state: %+v", account)
+	}
+}
+
+func TestStoreRejectsSupersededWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	oldWriter := Store{Path: path}
+	if err := oldWriter.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	defer oldWriter.Release()
+	oldData := NewData()
+	oldData.Accounts["old"] = &Account{Health: health.Healthy}
+	if err := oldWriter.Save(oldData); err != nil {
+		t.Fatal(err)
+	}
+
+	newWriter := Store{Path: path}
+	if err := newWriter.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	defer newWriter.Release()
+	oldWriter.Release()
+	newData := NewData()
+	newData.Accounts["new"] = &Account{Health: health.Healthy}
+	if err := newWriter.Save(newData); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldWriter.Save(oldData); !errors.Is(err, ErrWriterSuperseded) {
+		t.Fatalf("superseded save error=%v, want ErrWriterSuperseded", err)
+	}
+	loaded, err := newWriter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Accounts["new"] == nil || loaded.Accounts["old"] != nil {
+		t.Fatalf("superseded writer replaced newer state: %+v", loaded.Accounts)
+	}
+}
+
+func TestWriterClaimSerializesWithInFlightCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	oldWriter := Store{Path: path}
+	if err := oldWriter.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	commitValidated := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	oldWriter.beforeCommit = func() {
+		close(commitValidated)
+		<-releaseCommit
+	}
+	oldData := NewData()
+	oldData.Accounts["old"] = &Account{Health: health.Healthy}
+	saveDone := make(chan error, 1)
+	go func() { saveDone <- oldWriter.Save(oldData) }()
+	select {
+	case <-commitValidated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old writer did not reach its validated commit")
+	}
+
+	newWriter := Store{Path: path}
+	claimStarted := make(chan struct{})
+	newWriter.beforeClaim = func() { close(claimStarted) }
+	claimDone := make(chan error, 1)
+	go func() { claimDone <- newWriter.Claim() }()
+	select {
+	case <-claimStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement claim did not reach the path lock")
+	}
+	select {
+	case err := <-claimDone:
+		t.Fatalf("replacement claim passed an in-flight commit: %v", err)
+	default:
+	}
+
+	close(releaseCommit)
+	if err := <-saveDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-claimDone; err != nil {
+		t.Fatal(err)
+	}
+	defer oldWriter.Release()
+	defer newWriter.Release()
+	newData := NewData()
+	newData.Accounts["new"] = &Account{Health: health.Healthy}
+	if err := newWriter.Save(newData); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldWriter.Save(oldData); !errors.Is(err, ErrWriterSuperseded) {
+		t.Fatalf("old writer remained active after serialized claim: %v", err)
+	}
+}
+
+func TestWriterClaimContextExpiresBehindInFlightCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	oldWriter := Store{Path: path}
+	if err := oldWriter.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	commitValidated := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	oldWriter.beforeCommit = func() {
+		close(commitValidated)
+		<-releaseCommit
+	}
+	saveDone := make(chan error, 1)
+	go func() { saveDone <- oldWriter.Save(NewData()) }()
+	select {
+	case <-commitValidated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old writer did not enter its commit")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	newWriter := Store{Path: path}
+	started := time.Now()
+	err := newWriter.ClaimContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("claim error=%v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("context-bounded claim returned too late: %s", elapsed)
+	}
+	close(releaseCommit)
+	if err := <-saveDone; err != nil {
+		t.Fatal(err)
+	}
+	oldWriter.Release()
+}
+
+func TestWriterLeaseCanonicalizesSymlinkedDirectory(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasDir := filepath.Join(root, "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	realPath := filepath.Join(realDir, "state.json")
+	aliasPath := filepath.Join(aliasDir, "state.json")
+
+	oldWriter := Store{Path: aliasPath}
+	if err := oldWriter.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	commitValidated := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	oldWriter.beforeCommit = func() {
+		close(commitValidated)
+		<-releaseCommit
+	}
+	saveDone := make(chan error, 1)
+	go func() { saveDone <- oldWriter.Save(NewData()) }()
+	select {
+	case <-commitValidated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("aliased writer did not enter its commit")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	newWriter := Store{Path: realPath}
+	if err := newWriter.ClaimContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("real-path claim bypassed aliased commit: %v", err)
+	}
+	close(releaseCommit)
+	if err := <-saveDone; err != nil {
+		t.Fatal(err)
+	}
+	oldWriter.Release()
+}
+
+func TestWriterLeaseRemainsStableWhenStateFileIsSymlink(t *testing.T) {
+	root := t.TempDir()
+	targetPath := filepath.Join(root, "target.json")
+	if err := (Store{Path: targetPath}).Save(NewData()); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(root, "state.json")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	store := Store{Path: linkPath}
+	if err := store.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Release()
+	first := NewData()
+	first.Accounts["first"] = &Account{Health: health.Healthy}
+	if err := store.Save(first); err != nil {
+		t.Fatal(err)
+	}
+	second := NewData()
+	second.Accounts["second"] = &Account{Health: health.Healthy}
+	if err := store.Save(second); err != nil {
+		t.Fatalf("second save changed lease authority after replacing leaf symlink: %v", err)
+	}
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("atomic save unexpectedly retained the state-file symlink")
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Accounts["second"] == nil || loaded.Accounts["first"] != nil {
+		t.Fatalf("second save was not persisted through stable authority: %+v", loaded.Accounts)
+	}
+}
+
+func TestSuppressionRollbackCanonicalizesSymlinkedDirectory(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasDir := filepath.Join(root, "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	realPath := filepath.Join(realDir, "state.json")
+	aliasPath := filepath.Join(aliasDir, "state.json")
+	attemptAt := time.Now().UTC()
+	data := NewData()
+	data.Accounts["claude:one"] = &Account{
+		AccountKey:                 "claude:one",
+		Identity:                   "claude|email|same@example.com",
+		Health:                     health.ReauthRequired,
+		IncidentGeneration:         4,
+		LastAlertAttemptAt:         attemptAt,
+		LastAlertAttemptGeneration: 4,
+	}
+	RegisterSuppressionRollback(aliasPath, SuppressionRollback{
+		AccountKey: "claude:one",
+		Identity:   "claude|email|same@example.com",
+		Kind:       AlertSuppression,
+		Generation: 4,
+		AttemptAt:  attemptAt,
+	})
+	if err := (Store{Path: realPath}).Save(data); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (Store{Path: realPath}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := loaded.Accounts["claude:one"]
+	if account == nil || !account.LastAlertAttemptAt.IsZero() || account.LastAlertAttemptGeneration != 0 {
+		t.Fatalf("rollback registered through symlink alias was not applied: %+v", account)
+	}
+}
+
+func TestSuppressionRollbackFollowsUniqueIdentityWithoutClearingReusedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	attemptAt := time.Now().UTC()
+	data := NewData()
+	data.Accounts["claude:old-key"] = &Account{
+		AccountKey:                 "claude:old-key",
+		Identity:                   "claude|email|unrelated@example.com",
+		Health:                     health.ReauthRequired,
+		IncidentGeneration:         4,
+		LastAlertAttemptAt:         attemptAt,
+		LastAlertAttemptGeneration: 4,
+	}
+	data.Accounts["claude:new-key"] = &Account{
+		AccountKey:                 "claude:new-key",
+		Identity:                   "claude|email|same@example.com",
+		Health:                     health.ReauthRequired,
+		IncidentGeneration:         4,
+		LastAlertAttemptAt:         attemptAt,
+		LastAlertAttemptGeneration: 4,
+	}
+	RegisterSuppressionRollback(path, SuppressionRollback{
+		AccountKey: "claude:old-key",
+		Identity:   "claude|email|same@example.com",
+		Kind:       AlertSuppression,
+		Generation: 4,
+		AttemptAt:  attemptAt,
+	})
+	if err := (Store{Path: path}).Save(data); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (Store{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused := loaded.Accounts["claude:old-key"]; reused == nil || reused.LastAlertAttemptAt.IsZero() || reused.LastAlertAttemptGeneration != 4 {
+		t.Fatalf("rollback cleared an unrelated account that reused the old key: %+v", reused)
+	}
+	if moved := loaded.Accounts["claude:new-key"]; moved == nil || !moved.LastAlertAttemptAt.IsZero() || moved.LastAlertAttemptGeneration != 0 {
+		t.Fatalf("rollback did not follow the unique logical identity: %+v", moved)
 	}
 }
 

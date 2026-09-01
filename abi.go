@@ -85,9 +85,10 @@ var (
 )
 
 type hostCallGate struct {
-	mu       sync.Mutex
-	stopping bool
-	calls    sync.WaitGroup
+	mu          sync.Mutex
+	stopping    bool
+	calls       sync.WaitGroup
+	waitStarted func()
 }
 
 func (g *hostCallGate) reset() {
@@ -114,6 +115,9 @@ func (g *hostCallGate) stopAccepting() {
 }
 
 func (g *hostCallGate) wait() {
+	if g.waitStarted != nil {
+		g.waitStarted()
+	}
 	g.calls.Wait()
 }
 

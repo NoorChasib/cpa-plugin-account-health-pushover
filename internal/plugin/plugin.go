@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,7 +16,10 @@ import (
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/protocol"
 )
 
-const ID = "account-health-pushover"
+const (
+	ID                        = "account-health-pushover"
+	defaultMonitorStopTimeout = 5 * time.Second
+)
 
 var Version = "0.1.0"
 
@@ -33,13 +37,25 @@ type Plugin struct {
 	host     Host
 	endpoint string
 
-	lifecycleMu sync.Mutex
-	mu          sync.RWMutex
-	monitor     *monitor.Monitor
+	lifecycleMu            sync.Mutex
+	mu                     sync.RWMutex
+	monitor                *monitor.Monitor
+	detached               []*monitor.Monitor
+	transitioning          bool
+	monitorStopTimeout     time.Duration
+	managementCheckTimeout time.Duration
+	beforeManagementCheck  func()
+	beforeMonitorPublish   func()
+	beforeFinalMonitorWait func()
 }
 
 func New(host Host, endpoint string) *Plugin {
-	return &Plugin{host: host, endpoint: endpoint}
+	return &Plugin{
+		host:                   host,
+		endpoint:               endpoint,
+		monitorStopTimeout:     defaultMonitorStopTimeout,
+		managementCheckTimeout: 30 * time.Second,
+	}
 }
 
 func (p *Plugin) Handle(method string, raw []byte) (any, error) {
@@ -47,7 +63,7 @@ func (p *Plugin) Handle(method string, raw []byte) (any, error) {
 	case protocol.MethodPluginRegister, protocol.MethodPluginReconfigure:
 		return p.configure(raw)
 	case protocol.MethodPluginQuiesce:
-		p.stop()
+		p.quiesce()
 		return map[string]any{}, nil
 	case protocol.MethodManagementRegister:
 		return managementRegistration(), nil
@@ -61,7 +77,7 @@ func (p *Plugin) Handle(method string, raw []byte) (any, error) {
 }
 
 func (p *Plugin) Shutdown() {
-	p.stop()
+	p.stopFinal()
 }
 
 func (p *Plugin) configure(raw []byte) (protocol.Registration, error) {
@@ -83,27 +99,66 @@ func (p *Plugin) configure(raw []byte) (protocol.Registration, error) {
 	p.mu.Lock()
 	oldMonitor := p.monitor
 	p.monitor = nil
+	p.transitioning = true
 	p.mu.Unlock()
 	if oldMonitor != nil {
-		oldMonitor.Stop()
+		oldMonitor.StopWithin(p.monitorStopTimeout)
+		// StopWithin reports host-operation drain, not completion of every
+		// cancellation-ignoring delivery or asynchronous retirement write. Retain
+		// every retired monitor so final native shutdown can join all plugin-owned
+		// work before the shared object is unloaded.
+		p.detached = append(p.detached, oldMonitor)
+	}
+	if p.beforeMonitorPublish != nil {
+		p.beforeMonitorPublish()
 	}
 	newMonitor.Start()
 	p.mu.Lock()
 	p.monitor = newMonitor
+	p.transitioning = false
 	p.mu.Unlock()
 	return registration(), nil
 }
 
-func (p *Plugin) stop() {
+func (p *Plugin) quiesce() {
 	p.lifecycleMu.Lock()
 	defer p.lifecycleMu.Unlock()
 	p.mu.Lock()
 	current := p.monitor
 	p.monitor = nil
+	p.transitioning = true
 	p.mu.Unlock()
 	if current != nil {
-		current.Stop()
+		current.StopWithin(p.monitorStopTimeout)
+		p.detached = append(p.detached, current)
 	}
+	p.mu.Lock()
+	p.transitioning = false
+	p.mu.Unlock()
+}
+
+func (p *Plugin) stopFinal() {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.mu.Lock()
+	current := p.monitor
+	p.monitor = nil
+	p.transitioning = true
+	p.mu.Unlock()
+	monitors := append([]*monitor.Monitor(nil), p.detached...)
+	p.detached = nil
+	if current != nil {
+		monitors = append(monitors, current)
+	}
+	if p.beforeFinalMonitorWait != nil {
+		p.beforeFinalMonitorWait()
+	}
+	for _, oldMonitor := range monitors {
+		oldMonitor.Stop()
+	}
+	p.mu.Lock()
+	p.transitioning = false
+	p.mu.Unlock()
 }
 
 func (p *Plugin) handleUsage(raw []byte) (map[string]any, error) {
@@ -131,16 +186,20 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid management request"}), nil
 	}
-	p.mu.RLock()
-	current := p.monitor
-	p.mu.RUnlock()
-	if current == nil {
-		return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": "plugin is not configured"}), nil
-	}
 	path := strings.TrimSuffix(request.Path, "/")
 	method := strings.ToUpper(strings.TrimSpace(request.Method))
 	if method == "" {
 		method = http.MethodGet
+	}
+	p.mu.RLock()
+	current := p.monitor
+	transitioning := p.transitioning
+	p.mu.RUnlock()
+	if current == nil {
+		if transitioning && method == http.MethodPost && strings.HasSuffix(path, "/check") {
+			return lifecycleRetryResponse(), nil
+		}
+		return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": "plugin is not configured"}), nil
 	}
 	switch {
 	case method == http.MethodGet && strings.HasSuffix(path, "/status"):
@@ -149,9 +208,25 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 		}
 		return htmlResponse(http.StatusOK, renderStatusPage(redactResourceStatus(current.Snapshot()))), nil
 	case method == http.MethodPost && strings.HasSuffix(path, "/check"):
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		status := current.CheckNow(ctx)
+		if p.beforeManagementCheck != nil {
+			p.beforeManagementCheck()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), p.managementCheckTimeout)
+		status, checkErr := current.CheckNow(ctx)
 		cancel()
+		if errors.Is(checkErr, monitor.ErrStopping) {
+			p.mu.RLock()
+			replacement := p.monitor
+			p.mu.RUnlock()
+			if replacement != nil && replacement != current {
+				retryCtx, cancelRetry := context.WithTimeout(context.Background(), p.managementCheckTimeout)
+				status, checkErr = replacement.CheckNow(retryCtx)
+				cancelRetry()
+			}
+		}
+		if errors.Is(checkErr, monitor.ErrStopping) || errors.Is(checkErr, context.Canceled) || errors.Is(checkErr, context.DeadlineExceeded) {
+			return lifecycleRetryResponse(), nil
+		}
 		return jsonResponse(http.StatusOK, status), nil
 	case method == http.MethodPost && strings.HasSuffix(path, "/test"):
 		ctx, cancel := context.WithTimeout(context.Background(), current.NotificationTimeout())
@@ -169,6 +244,15 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "route not found"}), nil
 	}
+}
+
+func lifecycleRetryResponse() protocol.ManagementResponse {
+	response := jsonResponse(http.StatusServiceUnavailable, map[string]any{
+		"error":     "monitor lifecycle transition in progress",
+		"retryable": true,
+	})
+	response.Headers.Set("Retry-After", "1")
+	return response
 }
 
 func registration() protocol.Registration {

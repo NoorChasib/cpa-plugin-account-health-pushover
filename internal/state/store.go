@@ -1,12 +1,15 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NoorChasib/cpa-plugin-account-health-pushover/internal/health"
@@ -14,6 +17,150 @@ import (
 )
 
 const CurrentVersion = 1
+
+var ErrWriterSuperseded = errors.New("state writer was superseded")
+
+type SuppressionKind string
+
+const (
+	AlertSuppression    SuppressionKind = "alert"
+	RecoverySuppression SuppressionKind = "recovery"
+)
+
+type SuppressionRollback struct {
+	AccountKey string
+	Identity   string
+	Kind       SuppressionKind
+	Generation uint64
+	AttemptAt  time.Time
+}
+
+type suppressionRollbackSet struct {
+	mu      sync.Mutex
+	entries map[SuppressionRollback]struct{}
+}
+
+type writerLease struct {
+	mu    sync.Mutex
+	owner uint64
+}
+
+var (
+	writerLeases         sync.Map
+	writerGeneration     atomic.Uint64
+	suppressionRollbacks sync.Map
+)
+
+func canonicalStatePath(path string) string {
+	cleaned := filepath.Clean(path)
+	if absolute, err := filepath.Abs(cleaned); err == nil {
+		cleaned = absolute
+	}
+
+	// The state directory may not exist before the first save. Resolve the
+	// nearest existing ancestor, then append the missing path components so
+	// symlinked directory aliases share one process-local writer authority.
+	// Resolve directory aliases only. Save atomically renames onto Path, so a
+	// symlink in the final filename is intentionally replaced rather than written
+	// through; treating that leaf as its target would change the lease key after
+	// the first save.
+	current := filepath.Dir(cleaned)
+	missing := []string{filepath.Base(cleaned)}
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return cleaned
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func leaseFor(path string) *writerLease {
+	path = canonicalStatePath(path)
+	lease, _ := writerLeases.LoadOrStore(path, &writerLease{})
+	return lease.(*writerLease)
+}
+
+func rollbackSetFor(path string) *suppressionRollbackSet {
+	path = canonicalStatePath(path)
+	set, _ := suppressionRollbacks.LoadOrStore(path, &suppressionRollbackSet{entries: make(map[SuppressionRollback]struct{})})
+	return set.(*suppressionRollbackSet)
+}
+
+// RegisterSuppressionRollback records an exact, process-local rollback before a
+// monitor relinquishes its writer lease. Store.Load and Store.Save both apply
+// registered rollbacks, so a replacement cannot inherit a five-minute marker
+// for accepted work that was never attempted even if old filesystem I/O is
+// still unwinding.
+func RegisterSuppressionRollback(path string, rollback SuppressionRollback) {
+	if strings.TrimSpace(path) == "" || rollback.AttemptAt.IsZero() || rollback.Generation == 0 {
+		return
+	}
+	set := rollbackSetFor(path)
+	set.mu.Lock()
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for existing := range set.entries {
+		if existing.AttemptAt.Before(cutoff) {
+			delete(set.entries, existing)
+		}
+	}
+	set.entries[rollback] = struct{}{}
+	set.mu.Unlock()
+}
+
+func applySuppressionRollbacks(path string, data *Data) {
+	if data == nil || strings.TrimSpace(path) == "" || len(data.Accounts) == 0 {
+		return
+	}
+	loaded, ok := suppressionRollbacks.Load(canonicalStatePath(path))
+	if !ok {
+		return
+	}
+	set := loaded.(*suppressionRollbackSet)
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	for rollback := range set.entries {
+		account := data.Accounts[rollback.AccountKey]
+		if account != nil && rollback.Identity != "" && account.Identity != rollback.Identity {
+			account = nil
+		}
+		if account == nil && rollback.Identity != "" {
+			var match *Account
+			for _, candidate := range data.Accounts {
+				if candidate == nil || candidate.Identity != rollback.Identity {
+					continue
+				}
+				if match != nil {
+					match = nil
+					break
+				}
+				match = candidate
+			}
+			account = match
+		}
+		if account == nil || account.IncidentGeneration != rollback.Generation {
+			continue
+		}
+		switch rollback.Kind {
+		case AlertSuppression:
+			if account.LastAlertAttemptGeneration == rollback.Generation && account.LastAlertAttemptAt.Equal(rollback.AttemptAt) {
+				account.LastAlertAttemptAt = time.Time{}
+				account.LastAlertAttemptGeneration = 0
+			}
+		case RecoverySuppression:
+			if account.LastRecoveryAttemptAt.Equal(rollback.AttemptAt) {
+				account.LastRecoveryAttemptAt = time.Time{}
+			}
+		}
+	}
+}
 
 type Account struct {
 	AccountKey                      string                   `json:"account_key"`
@@ -64,11 +211,82 @@ type Data struct {
 }
 
 type Store struct {
-	Path string
+	Path         string
+	writerToken  uint64
+	beforeClaim  func()
+	beforeCommit func()
+}
+
+func (s *Store) Claim() error {
+	return s.ClaimContext(context.Background())
+}
+
+func (s *Store) ClaimContext(ctx context.Context) error {
+	if strings.TrimSpace(s.Path) == "" {
+		return errors.New("state file path is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.beforeClaim != nil {
+		s.beforeClaim()
+	}
+	lease := leaseFor(s.Path)
+	for !lease.mu.TryLock() {
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	defer lease.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	token := writerGeneration.Add(1)
+	if token == 0 {
+		token = writerGeneration.Add(1)
+	}
+	lease.owner = token
+	s.writerToken = token
+	return nil
+}
+
+func (s *Store) Release() {
+	if s == nil || strings.TrimSpace(s.Path) == "" || s.writerToken == 0 {
+		return
+	}
+	lease := leaseFor(s.Path)
+	lease.mu.Lock()
+	if lease.owner == s.writerToken {
+		lease.owner = 0
+	}
+	lease.mu.Unlock()
 }
 
 func NewData() Data {
 	return Data{Version: CurrentVersion, Accounts: make(map[string]*Account)}
+}
+
+func Clone(data Data) Data {
+	clone := data
+	clone.Accounts = make(map[string]*Account, len(data.Accounts))
+	for key, account := range data.Accounts {
+		if account == nil {
+			clone.Accounts[key] = nil
+			continue
+		}
+		accountClone := *account
+		clone.Accounts[key] = &accountClone
+	}
+	return clone
 }
 
 func (s Store) Load() (Data, error) {
@@ -114,6 +332,7 @@ func (s Store) Load() (Data, error) {
 	if data.LastNotificationErr != "" {
 		data.LastNotificationErr = "previous notification delivery failed"
 	}
+	applySuppressionRollbacks(s.Path, &data)
 	return data, nil
 }
 
@@ -126,6 +345,7 @@ func (s Store) Save(data Data) error {
 	if data.Accounts == nil {
 		data.Accounts = make(map[string]*Account)
 	}
+	applySuppressionRollbacks(s.Path, &data)
 	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode state file: %w", err)
@@ -159,6 +379,16 @@ func (s Store) Save(data Data) error {
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("close temporary state file: %w", err)
+	}
+	lease := leaseFor(s.Path)
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if (s.writerToken == 0 && lease.owner != 0) || (s.writerToken != 0 && lease.owner != s.writerToken) {
+		_ = os.Remove(tmpName)
+		return ErrWriterSuperseded
+	}
+	if s.beforeCommit != nil {
+		s.beforeCommit()
 	}
 	if err := os.Rename(tmpName, s.Path); err != nil {
 		_ = os.Remove(tmpName)
