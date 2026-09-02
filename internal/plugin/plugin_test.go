@@ -802,6 +802,11 @@ func TestRegistrationUsesCurrentABIContract(t *testing.T) {
 	for _, field := range registration.Metadata.ConfigFields {
 		fieldNames[field.Name] = true
 	}
+	for _, field := range registration.Metadata.ConfigFields {
+		if field.Name == "providers" && !strings.Contains(field.Description, "xai") {
+			t.Fatalf("providers field does not document xai: %q", field.Description)
+		}
+	}
 	for _, required := range []string{"providers", "scan-interval", "startup-grace", "transient-confirm-after", "unauthorized-confirm-after", "usage-recheck-delay", "notify-recovery", "reminder-interval", "pushover-app-token-env", "pushover-user-key-env", "management-url"} {
 		if !fieldNames[required] {
 			t.Fatalf("missing ConfigField %q", required)
@@ -1119,7 +1124,15 @@ func TestManagementActionsRejectCrossSiteBrowserRequests(t *testing.T) {
 		{"Sec-Fetch-Site": {"same-site"}, "X-Account-Health-Action": {"1"}},
 		{"Sec-Fetch-Site": {"same-origin"}},
 		{"Sec-Fetch-Site": {""}, "X-Account-Health-Action": {"1"}},
-		{"Origin": {"https://evil.example"}},
+		// No fetch metadata: only a single well-formed plain-http origin with the
+		// action header is a legitimate browser shape.
+		{"Origin": {"http://cpa.example:8317"}},
+		{"Origin": {"https://evil.example"}, "X-Account-Health-Action": {"1"}},
+		{"Origin": {"null"}, "X-Account-Health-Action": {"1"}},
+		{"Origin": {"http://a.example", "http://b.example"}, "X-Account-Health-Action": {"1"}},
+		{"Origin": {"http://user@cpa.example"}, "X-Account-Health-Action": {"1"}},
+		{"Origin": {"http://cpa.example/path"}, "X-Account-Health-Action": {"1"}},
+		{"Origin": {"not a url"}, "X-Account-Health-Action": {"1"}},
 	}
 	for _, headers := range rejected {
 		for _, path := range []string{check, test} {
@@ -1136,5 +1149,13 @@ func TestManagementActionsRejectCrossSiteBrowserRequests(t *testing.T) {
 	}
 	if status := call(check, nil); status != http.StatusOK {
 		t.Fatalf("header-only non-browser check = %d, want 200", status)
+	}
+	// Browsers omit Sec-Fetch-Site for plain-http non-loopback URLs, so a
+	// same-origin page served over http:// arrives as Origin + action header.
+	plainHTTP := http.Header{"Origin": {"http://vps.example.ts.net:8317"}, "X-Account-Health-Action": {"1"}}
+	for _, path := range []string{check, test} {
+		if status := call(path, plainHTTP); status == http.StatusForbidden {
+			t.Fatalf("%s from plain-http browser page = 403, want accepted", path)
+		}
 	}
 }

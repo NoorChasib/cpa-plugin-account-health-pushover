@@ -113,7 +113,7 @@ type CredentialStatus struct {
 func Default() Config {
 	return Config{
 		Enabled:                    true,
-		Providers:                  []string{"claude", "codex"},
+		Providers:                  []string{"claude", "codex", "xai"},
 		ScanInterval:               time.Minute,
 		StartupGrace:               30 * time.Second,
 		TransientConfirmAfter:      10 * time.Minute,
@@ -225,7 +225,7 @@ func (c *Config) Validate() error {
 		if provider == "" {
 			return errors.New("providers must not contain an empty value")
 		}
-		if provider != "claude" && provider != "codex" {
+		if !SupportedProvider(provider) {
 			return fmt.Errorf("unsupported provider %q", provider)
 		}
 		seen[provider] = struct{}{}
@@ -321,6 +321,15 @@ func (c Config) FormatDisplayTime(value time.Time, fallback string) string {
 		return fallback
 	}
 	return value.In(c.DisplayLocation()).Format(DisplayTimeLayout)
+}
+
+// SupportedProviders lists the CPA OAuth provider IDs this plugin can monitor.
+// "xai" is CPA's provider ID for Grok Build OAuth accounts.
+var SupportedProviders = []string{"claude", "codex", "xai"}
+
+// SupportedProvider reports whether a normalized provider ID is monitorable.
+func SupportedProvider(provider string) bool {
+	return slices.Contains(SupportedProviders, strings.ToLower(strings.TrimSpace(provider)))
 }
 
 func (c Config) ProviderEnabled(provider string) bool {

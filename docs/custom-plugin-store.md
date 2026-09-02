@@ -10,7 +10,7 @@ The root registry is schema version 1 and contains one plugin entry. CPA continu
 
 ## Install
 
-1. Publish or select a valid GitHub release tag such as `v0.2.0`.
+1. Publish or select a valid GitHub release tag such as `v0.3.0`.
 2. Merge the custom source into existing CPA config:
 
    ```yaml
@@ -31,7 +31,7 @@ The root registry is schema version 1 and contains one plugin entry. CPA continu
    docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
    ```
 
-   A Plugin Store install writes a **versioned** library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.2.0.so` — not an unversioned file at the plugins root.
+   A Plugin Store install writes a **versioned** library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.3.0.so` — not an unversioned file at the plugins root.
 
 8. Add the plugin config and Pushover secret environment variables.
 9. Restart/reload CPA.

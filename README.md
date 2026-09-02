@@ -1,12 +1,12 @@
 # CLIProxyAPI Account Health → Pushover
 
-`account-health-pushover` is a native CLIProxyAPI (CPA) Go plugin that monitors Claude OAuth and Codex OAuth credentials and sends transition-based Pushover notifications when an account requires reauthentication or remains credential-unhealthy.
+`account-health-pushover` is a native CLIProxyAPI (CPA) Go plugin that monitors Claude, Codex, and Grok (xAI) OAuth credentials and sends transition-based Pushover notifications when an account requires reauthentication or remains credential-unhealthy.
 
 It deliberately does **not** alert for ordinary quota consumption. Five-hour limits, weekly limits, Claude model/Fable limits, HTTP 429 responses, and known quota cooldowns are credential-healthy operational states.
 
 ## What it does
 
-- Dynamically discovers Claude and Codex OAuth credentials through `host.auth.list`.
+- Dynamically discovers Claude, Codex, and Grok (CPA provider `xai`) OAuth credentials through `host.auth.list`.
 - Reads current runtime health through `host.auth.get_runtime`.
 - Classifies accounts as `healthy`, `quota_limited`, `suspect`, `credential_down`, `reauth_required`, `disabled`, or `removed`.
 - Immediately alerts on exact definitive refresh-path `unauthorized`/`invalid_grant` runtime states.
@@ -79,7 +79,7 @@ plugins:
     account-health-pushover:
       enabled: true
       priority: 20 # Plugin load/order priority only; unrelated to OAuth credential priority.
-      providers: [claude, codex]
+      providers: [claude, codex, xai]
       scan-interval: 1m
       startup-grace: 30s
       transient-confirm-after: 10m
@@ -115,7 +115,7 @@ Full deployment instructions: [docs/install-docker-compose.md](docs/install-dock
 2. Restart/reload CPA after changing configuration.
 3. Open Management Center → Plugin Store and refresh.
 4. Install **Account Health Pushover** (`account-health-pushover`).
-5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.2.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
+5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.3.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
 6. Add the two Coolify secret variables and enable the plugin config.
 7. Restart/reload CPA.
 8. Open **Account Health Pushover** from the Management Center sidebar. When the console is served from the CPA origin with the management key remembered, the page upgrades itself to the authenticated view with **Test notification** and **Check now** buttons; otherwise use the authenticated Management API.
@@ -134,7 +134,7 @@ Download the matching release archive plus `checksums.txt`, then verify and inst
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
-unzip account-health-pushover_0.2.0_linux_amd64.zip
+unzip account-health-pushover_0.3.0_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
 docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
@@ -177,7 +177,7 @@ The authenticated HTML view at `GET .../status/html` requires the same managemen
 
 At the audited CPA revision, management authentication is header-only (`Authorization: Bearer ...` or `X-Management-Key`); a query parameter is not a management credential, and ordinary address-bar navigation cannot add that header. Open the HTML route only through the sidebar upgrade, a browser/profile, or an authenticated reverse proxy that supplies the management header to both the page GET and its same-origin action POSTs.
 
-The two mutating routes are CSRF-gated. Browser requests (those carrying `Sec-Fetch-Site`) are accepted only when the value is `same-origin` or `none` **and** the request includes `X-Account-Health-Action: 1`; `same-site`, `cross-site`, empty metadata, and requests carrying `Origin` without fetch metadata are rejected with HTTP 403. Non-browser clients such as `curl` send neither header and authenticate with the management key alone. A fronting proxy that injects ambient management authentication must still enforce its own CSRF/origin policy for the entire Management API and must pass `Sec-Fetch-Site` unchanged.
+The two mutating routes are CSRF-gated. Browser requests carrying `Sec-Fetch-Site` are accepted only when the value is `same-origin` or `none` **and** the request includes `X-Account-Health-Action: 1`; `same-site`, `cross-site`, and empty metadata are rejected with HTTP 403. Browsers omit fetch metadata entirely for requests to non-secure URLs (plain `http://` on a non-loopback host, which is how many private CPA deployments are reached). In that case the gate accepts a single well-formed `http://` `Origin` plus the action header, because mixed-content blocking means that is the only origin a legitimate browser page can produce against a plain-HTTP server; `https://`, `null`, multi-valued, and malformed origins without metadata are rejected. Over plain HTTP the plugin therefore cannot prove same-origin, only "came from some plain-HTTP page"; serving CPA over HTTPS (for example with `tailscale serve`) restores the strict check automatically. Non-browser clients such as `curl` send neither header and authenticate with the management key alone. A fronting proxy that injects ambient management authentication must still enforce its own CSRF/origin policy for the entire Management API and must pass `Sec-Fetch-Site` unchanged.
 
 Example API actions:
 
@@ -198,7 +198,7 @@ Do not paste the management key into shell history on shared systems; use an env
 
 | Field | Default | Purpose |
 |---|---:|---|
-| `providers` | `[claude, codex]` | OAuth providers monitored dynamically. |
+| `providers` | `[claude, codex, xai]` | OAuth providers monitored dynamically. `xai` is CPA's provider ID for Grok Build OAuth accounts; they display as **Grok**. |
 | `scan-interval` | `1m` | Full roster/runtime reconciliation interval. |
 | `startup-grace` | `30s` | Initial grace before baseline classification; usage evidence is retained but cannot bypass this delay. |
 | `transient-confirm-after` | `10m` | Confirmation time before a typed transient `suspect` becomes `credential_down`. |
@@ -260,7 +260,7 @@ make vet
 make test-race
 make build
 make c-shared
-make package-current VERSION=0.2.0
+make package-current VERSION=0.3.0
 make checksums
 make verify-release
 ```
@@ -279,14 +279,14 @@ The smoke build enables a compile-time-only local/mock endpoint seam. Release bu
 
 ## Release assets
 
-A `v0.2.0` tag produces:
+A `v0.3.0` tag produces:
 
 ```text
-account-health-pushover_0.2.0_linux_amd64.zip
-account-health-pushover_0.2.0_linux_arm64.zip
-account-health-pushover_0.2.0_darwin_amd64.zip
-account-health-pushover_0.2.0_darwin_arm64.zip
-account-health-pushover_0.2.0_windows_amd64.zip
+account-health-pushover_0.3.0_linux_amd64.zip
+account-health-pushover_0.3.0_linux_arm64.zip
+account-health-pushover_0.3.0_darwin_amd64.zip
+account-health-pushover_0.3.0_darwin_arm64.zip
+account-health-pushover_0.3.0_windows_amd64.zip
 checksums.txt
 ```
 
@@ -302,6 +302,7 @@ Release procedure: [docs/release.md](docs/release.md).
 [ ] Coolify secrets are present but not printed
 [ ] Claude accounts discovered dynamically
 [ ] Codex accounts discovered dynamically
+[ ] Grok (xai) accounts discovered dynamically
 [ ] quota-limited accounts do not alert
 [ ] reauth-required account sends exactly one alert
 [ ] unchanged incident does not spam

@@ -19,8 +19,11 @@ func TestParseDefaults(t *testing.T) {
 	if !cfg.NotifyRecovery || cfg.NotifyDisabled || cfg.NotifyRemoved {
 		t.Fatalf("unexpected notification defaults: %+v", cfg)
 	}
-	if strings.Join(cfg.Providers, ",") != "claude,codex" {
+	if strings.Join(cfg.Providers, ",") != "claude,codex,xai" {
 		t.Fatalf("providers = %v", cfg.Providers)
+	}
+	if !cfg.ProviderEnabled("xai") || cfg.ProviderEnabled("gemini") {
+		t.Fatalf("provider enablement wrong: %v", cfg.Providers)
 	}
 	if cfg.DisplayTimezone != "UTC" || cfg.DisplayTimezoneWarning != "" {
 		t.Fatalf("display timezone default = %q warning=%q", cfg.DisplayTimezone, cfg.DisplayTimezoneWarning)

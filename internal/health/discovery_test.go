@@ -14,15 +14,17 @@ func TestDiscoverDynamicOAuthAccounts(t *testing.T) {
 		{AuthIndex: "claude-1", Provider: "claude", AccountType: "oauth", Email: "a@example.com"},
 		{AuthIndex: "codex-1", Provider: "codex", AccountType: "oauth", Email: "b@example.com"},
 		{AuthIndex: "gemini-1", Provider: "gemini", AccountType: "oauth", Email: "c@example.com"},
+		{AuthIndex: "xai-1", Provider: "xai", AccountType: "oauth", Email: "grok@example.com"},
+		{AuthIndex: "xai-key", Provider: "xai", AccountType: "api_key", Account: "xai-secret-must-not-leak"},
 		{AuthIndex: "claude-key", Provider: "claude", AccountType: "api_key", Account: "must-not-leak"},
 		{AuthIndex: "", Provider: "codex", AccountType: "oauth", Email: "missing-index@example.com"},
 		{AuthIndex: "claude-1", Provider: "claude", AccountType: "oauth", Email: "duplicate@example.com"},
 	}
 	got := Discover(roster, cfg)
-	if len(got) != 2 {
-		t.Fatalf("discovered %d accounts, want 2: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("discovered %d accounts, want 3: %+v", len(got), got)
 	}
-	if got[0].AuthIndex != "claude-1" || got[1].AuthIndex != "codex-1" {
+	if got[0].AuthIndex != "claude-1" || got[1].AuthIndex != "codex-1" || got[2].AuthIndex != "xai-1" {
 		t.Fatalf("unexpected accounts: %+v", got)
 	}
 }

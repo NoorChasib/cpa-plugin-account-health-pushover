@@ -42,7 +42,7 @@ The status error is intentionally sanitized. Use Pushover's dashboard and CPA ne
 
 Invoke **Check now** through CPA's authenticated Management API, then verify:
 
-- provider is `claude` or `codex`;
+- provider is `claude`, `codex`, or `xai` (Grok);
 - the credential is OAuth, not an API key;
 - CPA exposes a non-empty `auth_index`;
 - CPA has finished loading the auth file;
@@ -110,7 +110,11 @@ Sign in to the management console served from the same origin as CPA with **Reme
 
 ## Check now or Test notification returns HTTP 403
 
-The mutating routes require browser requests to be same-origin (`Sec-Fetch-Site: same-origin` or `none`) and to include `X-Account-Health-Action: 1`; `same-site`, `cross-site`, empty fetch metadata, and `Origin` without fetch metadata are rejected. Non-browser clients such as `curl` may omit both headers. A proxy that injects management authentication must pass `Sec-Fetch-Site` unchanged.
+The mutating routes require browser requests to be same-origin (`Sec-Fetch-Site: same-origin` or `none`) and to include `X-Account-Health-Action: 1`; `same-site`, `cross-site`, and empty fetch metadata are rejected. When CPA is reached over plain `http://` on a non-loopback host, browsers send no fetch metadata at all; the gate then accepts a single well-formed `http://` `Origin` plus the action header and rejects `https://`, `null`, multi-valued, or malformed origins. Versions before 0.3.0 rejected every plain-HTTP browser request with this 403; upgrade the plugin. Non-browser clients such as `curl` may omit both headers. A proxy that injects management authentication must pass `Sec-Fetch-Site` unchanged. Serving CPA over HTTPS restores the strict same-origin check.
+
+## Grok accounts show `suspect` or `credential_down` instead of `reauth_required`
+
+At the audited CPA revision, an xAI `bad-credentials` rejection is cooled down as `payment_required` rather than triggering an immediate refresh (upstream issue #4046). The plugin treats `payment_required` as `suspect` and confirms it over `transient-confirm-after` before alerting as `credential_down`. You are still notified; the reason code is less specific until CPA changes that behavior.
 
 ## Timestamps show the wrong zone
 

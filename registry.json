@@ -4,7 +4,7 @@
     {
       "id": "account-health-pushover",
       "name": "Account Health Pushover",
-      "description": "Sends Pushover alerts when Claude or Codex OAuth credentials require reauthentication or become credential-unhealthy.",
+      "description": "Sends Pushover alerts when Claude, Codex, or Grok (xAI) OAuth credentials require reauthentication or become credential-unhealthy.",
       "author": "NoorChasib",
       "repository": "https://github.com/NoorChasib/cpa-plugin-account-health-pushover",
       "homepage": "https://github.com/NoorChasib/cpa-plugin-account-health-pushover",
@@ -14,7 +14,8 @@
         "pushover",
         "oauth",
         "claude",
-        "codex"
+        "codex",
+        "grok"
       ]
     }
   ]

@@ -10,10 +10,17 @@ type classifier struct{}
 func ClaudeClassifier() ProviderClassifier { return classifier{} }
 func CodexClassifier() ProviderClassifier  { return classifier{} }
 
+// XAIClassifier covers CPA's "xai" provider (Grok Build OAuth). At the audited
+// CPA revision xAI shares the generic refresh manager, status fields, and
+// next_retry_after cooldown semantics with Claude and Codex, so the same
+// conservative classification applies.
+func XAIClassifier() ProviderClassifier { return classifier{} }
+
 func Classifiers() map[string]ProviderClassifier {
 	return map[string]ProviderClassifier{
 		"claude": ClaudeClassifier(),
 		"codex":  CodexClassifier(),
+		"xai":    XAIClassifier(),
 	}
 }
 

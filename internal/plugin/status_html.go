@@ -184,7 +184,7 @@ time .d,time .t{white-space:nowrap}
 <div class="header">
   <div>
     <h1>Account Health Pushover</h1>
-    <p class="subtitle">{{if .Authenticated}}Claude and Codex OAuth credential health with Pushover delivery state.{{else}}Redacted read-only view. Quota-limited accounts are credential-healthy and never trigger failure alerts.{{end}}</p>
+    <p class="subtitle">{{if .Authenticated}}Claude, Codex, and Grok OAuth credential health with Pushover delivery state.{{else}}Redacted read-only view. Quota-limited accounts are credential-healthy and never trigger failure alerts.{{end}}</p>
     <div class="pills">
       {{if .PluginEnabled}}<span class="pill ok">monitoring enabled</span>{{else}}<span class="pill warn">monitoring disabled</span>{{end}}
       {{if .MonitoringStale}}<span class="pill warn">snapshot stale</span>{{else}}<span class="pill ok">snapshot current</span>{{end}}
@@ -280,7 +280,7 @@ time .d,time .t{white-space:nowrap}
   </div>
 </div>
 {{else}}
-<div class="section"><div class="card"><p class="empty">No monitored Claude/Codex OAuth accounts have been observed yet.</p></div></div>
+<div class="section"><div class="card"><p class="empty">No monitored Claude, Codex, or Grok OAuth accounts have been observed yet.</p></div></div>
 {{end}}
 
 <p class="footnote">{{if .Authenticated}}Check now runs an immediate reconciliation and Test notification sends a safe Pushover test. Both post to same-origin management routes with the plugin action header; CPA must receive the management authentication header through the browser session or reverse proxy.{{else}}Account labels, auth indexes, reason codes, and error details are redacted on this unauthenticated page. When opened from the same origin as a signed-in management console, the full authenticated view loads in place.{{end}} Hover any timestamp for the exact UTC instant.</p>
@@ -499,6 +499,8 @@ func providerName(value string) string {
 		return "Claude"
 	case "codex":
 		return "Codex"
+	case "xai", "grok":
+		return "Grok"
 	default:
 		return "OAuth"
 	}

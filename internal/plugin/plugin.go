@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,7 @@ const (
 	actionRequestHeaderValue = "1"
 )
 
-var Version = "0.2.0"
+var Version = "0.3.0"
 
 type Host = monitor.Host
 
@@ -274,10 +275,18 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 }
 
 // actionRequestAllowed gates the mutating management actions against browser
-// cross-site requests. A request carrying browser fetch metadata must be
-// same-origin (or a top-level navigation, "none") and must include the plugin
-// action header; a request carrying Origin without fetch metadata is rejected.
-// Non-browser clients send neither header and pass on the management key alone.
+// cross-site requests.
+//
+//   - Requests carrying browser fetch metadata must be same-origin (or a
+//     top-level navigation, "none") and include the plugin action header.
+//   - Browsers omit fetch metadata for requests to non-secure (plain http://,
+//     non-loopback) URLs. In that case a single well-formed http:// Origin
+//     plus the action header is accepted: mixed-content blocking prevents an
+//     https:// page from posting here, so that is the only origin a
+//     legitimate browser page can produce. https://, "null", multi-valued,
+//     and malformed origins without metadata are rejected.
+//   - Non-browser clients send neither Origin nor fetch metadata and pass on
+//     the management key alone.
 func actionRequestAllowed(headers http.Header) bool {
 	fetchSite, hasFetchSite := headerTokens(headers, "Sec-Fetch-Site")
 	if hasFetchSite {
@@ -291,7 +300,31 @@ func actionRequestAllowed(headers http.Header) bool {
 		}
 		return headerHasToken(headers, actionRequestHeader, actionRequestHeaderValue)
 	}
-	return !headerPresent(headers, "Origin")
+	origins, hasOrigin := headerTokens(headers, "Origin")
+	if !hasOrigin {
+		return true
+	}
+	if len(origins) != 1 || !isPlainHTTPOrigin(origins[0]) {
+		return false
+	}
+	return headerHasToken(headers, actionRequestHeader, actionRequestHeaderValue)
+}
+
+// isPlainHTTPOrigin reports whether value is a well-formed http:// origin
+// (scheme and host only). Browsers omit fetch metadata for requests to such
+// origins, so this is the shape a legitimate plain-HTTP status page produces.
+func isPlainHTTPOrigin(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Scheme, "http") &&
+		parsed.Host != "" &&
+		parsed.User == nil &&
+		parsed.Path == "" &&
+		parsed.RawQuery == "" &&
+		parsed.Fragment == "" &&
+		!parsed.ForceQuery
 }
 
 func headerHasToken(headers http.Header, name, token string) bool {
@@ -340,7 +373,7 @@ func headerPresent(headers http.Header, name string) bool {
 
 func actionForbiddenResponse() protocol.ManagementResponse {
 	return jsonResponse(http.StatusForbidden, map[string]any{
-		"error": "browser requests must be same-origin and include the " + actionRequestHeader + " header",
+		"error": "browser requests must come from the same origin (or a plain-http origin when fetch metadata is unavailable) and include the " + actionRequestHeader + " header",
 	})
 }
 
@@ -380,7 +413,7 @@ func managementRegistration() protocol.ManagementRegistration {
 			{Method: http.MethodPost, Path: base + "/test", Description: "Sends a safe Pushover test notification."},
 		},
 		Resources: []protocol.ResourceRoute{
-			{Path: "/status", Menu: "Account Health Pushover", Description: "Shows Claude/Codex OAuth health and Pushover delivery state."},
+			{Path: "/status", Menu: "Account Health Pushover", Description: "Shows Claude, Codex, and Grok OAuth health and Pushover delivery state."},
 		},
 	}
 }
@@ -390,7 +423,7 @@ func configFields() []protocol.ConfigField {
 		return protocol.ConfigField{Name: name, Type: typ, Description: description}
 	}
 	return []protocol.ConfigField{
-		field("providers", "array", "OAuth providers to monitor. Supported values: claude, codex."),
+		field("providers", "array", "OAuth providers to monitor. Supported values: claude, codex, xai (Grok)."),
 		field("scan-interval", "string", "Full health reconciliation interval (default 1m)."),
 		field("startup-grace", "string", "Delay before the first baseline scan; usage events retain status evidence but cannot bypass it (default 30s)."),
 		field("transient-confirm-after", "string", "How long transient and ambiguous failures remain suspect before credential_down (default 10m)."),

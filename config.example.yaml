@@ -11,6 +11,7 @@ plugins:
       providers:
         - claude
         - codex
+        - xai # Grok Build OAuth accounts
 
       scan-interval: 1m
       startup-grace: 30s

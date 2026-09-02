@@ -1392,6 +1392,9 @@ func titleProvider(provider string) string {
 	if provider == "" {
 		return "OAuth"
 	}
+	if strings.EqualFold(provider, "xai") {
+		return "Grok"
+	}
 	runes := []rune(strings.ToLower(provider))
 	runes[0] = unicode.ToUpper(runes[0])
 	return string(runes)
