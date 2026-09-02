@@ -43,6 +43,8 @@ type Status struct {
 	NextScan            time.Time       `json:"next_scan,omitempty"`
 	StateFile           string          `json:"state_file,omitempty"`
 	StateFileHealth     string          `json:"state_file_health"`
+	DisplayTimezone     string          `json:"display_timezone"`
+	Warnings            []string        `json:"warnings,omitempty"`
 	Notifier            notifier.Status `json:"pushover"`
 	Accounts            []AccountStatus `json:"accounts"`
 }
@@ -117,6 +119,8 @@ func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *noti
 		status: Status{
 			PluginEnabled:   cfg.Enabled,
 			StateFileHealth: "not_initialized",
+			DisplayTimezone: cfg.DisplayTimezone,
+			Warnings:        configWarnings(cfg),
 		},
 		ctx:            ctx,
 		cancel:         cancel,
@@ -668,6 +672,7 @@ func (m *Monitor) Snapshot() Status {
 	m.stateMu.RLock()
 	status := m.status
 	status.Accounts = append([]AccountStatus(nil), m.status.Accounts...)
+	status.Warnings = append([]string(nil), m.status.Warnings...)
 	m.stateMu.RUnlock()
 	status.Notifier = m.client.Snapshot()
 	return status
@@ -1236,10 +1241,10 @@ func (m *Monitor) failureMessage(account *state.Account, notificationKind string
 	var title, body string
 	if notificationKind == "reminder" {
 		title = fmt.Sprintf("CLIProxyAPI: %s incident still unresolved", provider)
-		body = fmt.Sprintf("%s is still unavailable.\nIncident: %s\nReason: %s\nFirst detected: %s", account.Label, incidentKind, account.LastReasonCode, formatTime(account.FirstDetectedAt))
+		body = fmt.Sprintf("%s is still unavailable.\nIncident: %s\nReason: %s\nFirst detected: %s", account.Label, incidentKind, account.LastReasonCode, m.formatTime(account.FirstDetectedAt))
 	} else if account.Health == health.ReauthRequired {
 		title = fmt.Sprintf("CLIProxyAPI: %s reauth required", provider)
-		body = fmt.Sprintf("%s is unavailable because its OAuth credentials were rejected.\nManual sign-in is required.\nIncident: %s\nReason: %s\nDetected: %s\nOther healthy accounts will continue routing if available.", account.Label, incidentKind, account.LastReasonCode, formatTime(account.FirstDetectedAt))
+		body = fmt.Sprintf("%s is unavailable because its OAuth credentials were rejected.\nManual sign-in is required.\nIncident: %s\nReason: %s\nDetected: %s\nOther healthy accounts will continue routing if available.", account.Label, incidentKind, account.LastReasonCode, m.formatTime(account.FirstDetectedAt))
 	} else {
 		title = fmt.Sprintf("CLIProxyAPI: %s account down", provider)
 		duration := time.Duration(0)
@@ -1392,11 +1397,17 @@ func titleProvider(provider string) string {
 	return string(runes)
 }
 
-func formatTime(value time.Time) string {
-	if value.IsZero() {
-		return "unknown"
+// formatTime renders a notification timestamp in the configured display
+// timezone, e.g. "Tue Sep 1 2026 - 6:25:36 PM PDT".
+func (m *Monitor) formatTime(value time.Time) string {
+	return m.cfg.FormatDisplayTime(value, "unknown")
+}
+
+func configWarnings(cfg config.Config) []string {
+	if cfg.DisplayTimezoneWarning == "" {
+		return nil
 	}
-	return value.Local().Format("2006-01-02 15:04 MST")
+	return []string{cfg.DisplayTimezoneWarning}
 }
 
 func safeField(value string) string {

@@ -156,7 +156,11 @@ Without an explicit override, state loading waits until the host roster exposes 
 
 Management routes are registered under `/v0/management` and pass through CPA's management-key authentication. This plugin registers relative route paths under `/plugins/account-health-pushover/...`.
 
-Resource routes are registered under `/v0/resource/plugins/<plugin-id>` and are unauthenticated in current CPA. The read-only browser status resource contains no script and masks account labels/email addresses, auth indexes, closed reason diagnostics, notifier/monitoring errors, and the state path. It never solicits a management key. The authenticated Management status route retains exact safe labels/indexes and closed reason codes. Operators should still keep CPA's API port within the intended private network/reverse proxy.
+Resource routes are registered under `/v0/resource/plugins/<plugin-id>` and are unauthenticated in current CPA. A resource route's `Menu` value becomes the Management Center sidebar entry, and the console iframes the page from the CPA origin. Authenticated management GET routes must leave `Menu` empty, because the host converts GET+Menu management routes into unauthenticated legacy resource routes.
+
+The read-only browser status resource masks account labels/email addresses, auth indexes, closed reason diagnostics, notifier/monitoring errors, warnings, and the state path, and never solicits a management key. Its inline script may upgrade the view client-side by fetching the authenticated `GET /v0/management/plugins/account-health-pushover/status/html` route with a management key the official management console already persisted in same-origin localStorage (`cli-proxy-auth` with the `enc::v1::` obfuscation, or legacy `managementKey`); the server never authenticates or personalizes the resource response. The authenticated Management status routes retain exact safe labels/indexes and closed reason codes.
+
+Management authentication at the audited commit is header-only (`Authorization: Bearer` or `X-Management-Key`), and CPA's CORS layer can approve a sibling site's preflight and custom header. The plugin therefore gates `POST .../check` and `POST .../test` on `Sec-Fetch-Site` being `same-origin` or `none` plus the `X-Account-Health-Action: 1` header for browser requests, and rejects `Origin` without fetch metadata. Operators should still keep CPA's API port within the intended private network/reverse proxy.
 
 ## Optional probes
 

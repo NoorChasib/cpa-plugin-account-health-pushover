@@ -22,6 +22,37 @@ func TestParseDefaults(t *testing.T) {
 	if strings.Join(cfg.Providers, ",") != "claude,codex" {
 		t.Fatalf("providers = %v", cfg.Providers)
 	}
+	if cfg.DisplayTimezone != "UTC" || cfg.DisplayTimezoneWarning != "" {
+		t.Fatalf("display timezone default = %q warning=%q", cfg.DisplayTimezone, cfg.DisplayTimezoneWarning)
+	}
+}
+
+func TestDisplayTimezone(t *testing.T) {
+	cfg, err := Parse([]byte("display-timezone: America/Los_Angeles\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DisplayTimezone != "America/Los_Angeles" || cfg.DisplayTimezoneWarning != "" {
+		t.Fatalf("zone=%q warning=%q", cfg.DisplayTimezone, cfg.DisplayTimezoneWarning)
+	}
+	instant := time.Date(2026, time.September, 2, 1, 25, 36, 0, time.UTC)
+	if got := cfg.FormatDisplayTime(instant, "unknown"); got != "Tue Sep 1 2026 - 6:25:36 PM PDT" {
+		t.Fatalf("formatted = %q", got)
+	}
+	if got := cfg.FormatDisplayTime(time.Time{}, "unknown"); got != "unknown" {
+		t.Fatalf("zero formatted = %q", got)
+	}
+	local, err := Parse([]byte("display-timezone: local\n"))
+	if err != nil || local.DisplayTimezone != "Local" || local.DisplayLocation() != time.Local {
+		t.Fatalf("local zone = %+v err=%v", local.DisplayTimezone, err)
+	}
+	unknown, err := Parse([]byte("display-timezone: Mars/Olympus_Mons\n"))
+	if err != nil {
+		t.Fatalf("unknown zone must degrade, got error %v", err)
+	}
+	if unknown.DisplayTimezone != "UTC" || !strings.Contains(unknown.DisplayTimezoneWarning, "Mars/Olympus_Mons") {
+		t.Fatalf("unknown zone = %q warning=%q", unknown.DisplayTimezone, unknown.DisplayTimezoneWarning)
+	}
 }
 
 func TestParseCompleteConfig(t *testing.T) {

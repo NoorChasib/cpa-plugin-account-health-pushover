@@ -94,7 +94,27 @@ A `host.auth.list` or one/more `host.auth.get_runtime` callback failed. The plug
 
 ## Status resource exposure
 
-Current CPA resource routes are unauthenticated. The page is read-only, contains no script, never solicits a management key, and masks account labels/email addresses, auth indexes, reason diagnostics, notifier/monitoring errors, and state paths. It excludes tokens, raw auth JSON, and upstream response bodies. Keep CPA's port on the intended private network or protect it with the deployment reverse proxy. The authenticated Management status endpoint retains exact safe labels/indexes and closed reason codes, and Management actions remain protected by CPA's management key.
+Current CPA resource routes are unauthenticated. The server response for the sidebar page is always the redacted, read-only view: it never solicits a management key and masks account labels/email addresses, auth indexes, reason diagnostics, notifier/monitoring errors, warnings, and state paths. It excludes tokens, raw auth JSON, and upstream response bodies. Keep CPA's port on the intended private network or protect it with the deployment reverse proxy.
+
+The redacted page's inline script upgrades the view client-side to the authenticated `status/html` page when the browser holds a same-origin management session (a management-console key remembered in localStorage on the same origin, ambient reverse-proxy auth, or cookies). The key is only ever sent to same-origin CPA management routes. The authenticated view retains exact safe labels/indexes and closed reason codes, and the **Check now** / **Test notification** buttons remain protected by CPA's management key plus the plugin's same-origin CSRF gate.
+
+## Sidebar page stays on the redacted view
+
+The note under the status pills explains why. Common causes:
+
+- the management console is hosted on a different origin than CPA, so its localStorage entries are not visible to the page;
+- the console was signed in without **Remember password**, so no key is persisted;
+- a reverse proxy strips `Authorization` or the browser session does not carry ambient management auth.
+
+Sign in to the management console served from the same origin as CPA with **Remember password** enabled and reload, or use the authenticated JSON route and `curl`.
+
+## Check now or Test notification returns HTTP 403
+
+The mutating routes require browser requests to be same-origin (`Sec-Fetch-Site: same-origin` or `none`) and to include `X-Account-Health-Action: 1`; `same-site`, `cross-site`, empty fetch metadata, and `Origin` without fetch metadata are rejected. Non-browser clients such as `curl` may omit both headers. A proxy that injects management authentication must pass `Sec-Fetch-Site` unchanged.
+
+## Timestamps show the wrong zone
+
+Set `display-timezone` to an IANA zone such as `America/Los_Angeles`, or `local` for the host process zone, then reload/restart CPA. An unknown zone name falls back to UTC and adds a warning to the status page and JSON `warnings` field. Zone data is embedded in the plugin, so minimal containers without `/usr/share/zoneinfo` still resolve IANA names.
 
 ## Incident response checklist
 

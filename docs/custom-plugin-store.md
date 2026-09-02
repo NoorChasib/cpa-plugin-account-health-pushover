@@ -10,7 +10,7 @@ The root registry is schema version 1 and contains one plugin entry. CPA continu
 
 ## Install
 
-1. Publish or select a valid GitHub release tag such as `v0.1.0`.
+1. Publish or select a valid GitHub release tag such as `v0.2.0`.
 2. Merge the custom source into existing CPA config:
 
    ```yaml
@@ -31,12 +31,12 @@ The root registry is schema version 1 and contains one plugin entry. CPA continu
    docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
    ```
 
-   A Plugin Store install writes a **versioned** library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.1.0.so` — not an unversioned file at the plugins root.
+   A Plugin Store install writes a **versioned** library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.2.0.so` — not an unversioned file at the plugins root.
 
 8. Add the plugin config and Pushover secret environment variables.
 9. Restart/reload CPA.
-10. Open `/v0/resource/plugins/account-health-pushover/status`.
-11. Invoke **Test notification** and **Check now** through CPA's authenticated Management API.
+10. Open **Account Health Pushover** from the Management Center sidebar (`/v0/resource/plugins/account-health-pushover/status`).
+11. Click **Test notification** and **Check now** on the authenticated view, or invoke them through CPA's authenticated Management API.
 
 Current CPA derives the plugin ID from the installed library basename and accepts both the unversioned form `account-health-pushover.<ext>` and the versioned form `account-health-pushover-v<X.Y.Z>.<ext>`. The Plugin Store installer writes the versioned form to `<plugins-dir>/<goos>/<goarch>/account-health-pushover-v<X.Y.Z>.<ext>`; the host searches that platform directory before the plugins root, so manual root installs also load.
 
@@ -54,7 +54,7 @@ account-health-pushover.dll
 2. Refresh the Plugin Store.
 3. Choose update for `account-health-pushover`.
 4. Restart/reload CPA if requested by the current Management Center.
-5. Verify the read-only resource status, then invoke **Test notification** and **Check now** through CPA's authenticated Management API.
+5. Verify the sidebar status page, then invoke **Test notification** and **Check now** from the authenticated view or CPA's authenticated Management API.
 6. Confirm the installed binary remains after a container recreation.
 
 CPA selects release assets by exact runtime GOOS/GOARCH. An update is unavailable if that release does not contain the matching archive.

@@ -18,6 +18,17 @@ import (
 const (
 	DefaultAppTokenEnv = "CPA_PUSHOVER_APP_TOKEN"
 	DefaultUserKeyEnv  = "CPA_PUSHOVER_USER_KEY"
+
+	// DefaultDisplayTimezone is the zone used to render human-readable
+	// timestamps on the HTML status view and in Pushover message bodies.
+	DefaultDisplayTimezone = "UTC"
+
+	// DisplayTimeLayout renders instants as "Tue Sep 1 2026 - 6:25:36 PM PDT".
+	DisplayTimeLayout = DisplayDateLayout + " - " + DisplayClockLayout
+	// DisplayDateLayout is the date half of DisplayTimeLayout.
+	DisplayDateLayout = "Mon Jan 2 2006"
+	// DisplayClockLayout is the clock half of DisplayTimeLayout.
+	DisplayClockLayout = "3:04:05 PM MST"
 )
 
 var (
@@ -51,6 +62,12 @@ type Config struct {
 	StateFile                  string
 	HTTPTimeout                time.Duration
 	MaxConcurrentChecks        int
+	// DisplayTimezone is the validated IANA zone name, "UTC", or "Local". It is
+	// presentation-only: JSON status stays RFC3339 UTC.
+	DisplayTimezone string
+	// DisplayTimezoneWarning is set when display-timezone was unknown and the
+	// plugin fell back to UTC instead of rejecting the whole configuration.
+	DisplayTimezoneWarning string
 }
 
 type rawConfig struct {
@@ -79,6 +96,7 @@ type rawConfig struct {
 	StateFile                  string   `yaml:"state-file"`
 	HTTPTimeout                string   `yaml:"pushover-http-timeout"`
 	MaxConcurrentChecks        *int     `yaml:"max-concurrent-checks"`
+	DisplayTimezone            string   `yaml:"display-timezone"`
 }
 
 type Credentials struct {
@@ -113,6 +131,7 @@ func Default() Config {
 		PushoverUserKeyEnv:         DefaultUserKeyEnv,
 		HTTPTimeout:                10 * time.Second,
 		MaxConcurrentChecks:        4,
+		DisplayTimezone:            DefaultDisplayTimezone,
 	}
 }
 
@@ -189,6 +208,7 @@ func Parse(data []byte) (Config, error) {
 	if raw.MaxConcurrentChecks != nil {
 		cfg.MaxConcurrentChecks = *raw.MaxConcurrentChecks
 	}
+	cfg.DisplayTimezone, cfg.DisplayTimezoneWarning = resolveDisplayTimezone(raw.DisplayTimezone)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -251,6 +271,56 @@ func (c *Config) Validate() error {
 	}
 	c.Providers = slices.Sorted(maps.Keys(seen))
 	return nil
+}
+
+// resolveDisplayTimezone validates a display-timezone value. It accepts IANA
+// names ("America/Los_Angeles"), "UTC", and "local" (the host process zone).
+// Because the zone only affects presentation, an unknown name degrades to UTC
+// with a status warning instead of rejecting the whole configuration.
+func resolveDisplayTimezone(value string) (string, string) {
+	trimmed := strings.TrimSpace(value)
+	switch strings.ToLower(trimmed) {
+	case "", "utc", "z":
+		return DefaultDisplayTimezone, ""
+	case "local":
+		return "Local", ""
+	}
+	loc, err := time.LoadLocation(trimmed)
+	if err != nil {
+		return DefaultDisplayTimezone, fmt.Sprintf("display-timezone %q is not a known IANA zone; timestamps are shown in UTC", trimmed)
+	}
+	return loc.String(), ""
+}
+
+// DisplayLocation returns the *time.Location for DisplayTimezone, falling back
+// to UTC when the name is empty or cannot be loaded.
+func (c Config) DisplayLocation() *time.Location {
+	return LoadDisplayLocation(c.DisplayTimezone)
+}
+
+// LoadDisplayLocation resolves a validated display zone name to a location,
+// treating any failure as UTC so rendering never fails on presentation input.
+func LoadDisplayLocation(name string) *time.Location {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "utc", "z":
+		return time.UTC
+	case "local":
+		return time.Local
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(name))
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}
+
+// FormatDisplayTime renders an instant in the configured display zone using
+// DisplayTimeLayout, or the fallback text for a zero time.
+func (c Config) FormatDisplayTime(value time.Time, fallback string) string {
+	if value.IsZero() {
+		return fallback
+	}
+	return value.In(c.DisplayLocation()).Format(DisplayTimeLayout)
 }
 
 func (c Config) ProviderEnabled(provider string) bool {

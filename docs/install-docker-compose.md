@@ -151,14 +151,16 @@ No code-level imports or runtime dependency connect the projects.
    docker logs --tail=200 cli-proxy-api
    ```
 
-6. Open:
+6. Open **Account Health Pushover** from the Management Center sidebar, or directly:
 
    ```text
    /v0/resource/plugins/account-health-pushover/status
    ```
 
-7. Invoke **Test notification** through CPA's authenticated Management API and confirm Pushover receives the safe test message.
-8. Invoke **Check now** through the authenticated Management API and confirm Claude/Codex accounts appear.
+   From a console served on the CPA origin with the management key remembered, the page upgrades itself to the authenticated view.
+
+7. Click **Test notification** on the authenticated view (or invoke the authenticated Management API) and confirm Pushover receives the safe test message.
+8. Click **Check now** (or invoke the authenticated Management API) and confirm Claude/Codex accounts appear.
 9. Recreate/redeploy the container and verify the plugin remains installed.
 
 ## Manual pre-release install
@@ -173,11 +175,11 @@ For Linux AMD64 (`--ignore-missing` lets the single downloaded archive verify ag
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
-unzip account-health-pushover_0.1.0_linux_amd64.zip
+unzip account-health-pushover_0.2.0_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
 ```
 
-For ARM64, use `account-health-pushover_0.1.0_linux_arm64.zip`.
+For ARM64, use `account-health-pushover_0.2.0_linux_arm64.zip`.
 
 Update by copying a verified newer library to the same path and restarting. Uninstall by removing the library, restarting, and disabling/removing the plugin config.

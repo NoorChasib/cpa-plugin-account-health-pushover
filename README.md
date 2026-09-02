@@ -17,7 +17,8 @@ It deliberately does **not** alert for ordinary quota consumption. Five-hour lim
 - Supports 12-hour unresolved-incident reminders by default; `0` disables reminders.
 - Coalesces simultaneous notifications in a bounded asynchronous worker.
 - Decodes only `AuthIndex`, `Failed`, and `Failure.StatusCode` from failed usage records, retains that structured status evidence briefly, and schedules a delayed runtime recheck; it never materializes the failure body or sends from the request callback.
-- Provides authenticated status, **Check now**, and **Test notification** Management routes plus a browser status resource.
+- Provides authenticated JSON status, an authenticated browser status page with **Check now** and **Test notification** buttons, and a redacted read-only browser resource that appears in the Management Center sidebar.
+- Renders timestamps in a configurable `display-timezone` as `Tue Sep 1 2026 - 6:25:36 PM PDT` on the status page and in Pushover messages.
 - Never changes credential priority, routing policy, quota state, OAuth tokens, or auth files.
 
 This repository has no code-level dependency on the separate reset-priority plugin.
@@ -101,6 +102,7 @@ plugins:
       state-file: ""
       pushover-http-timeout: 10s
       max-concurrent-checks: 4
+      display-timezone: UTC # e.g. America/Los_Angeles, or "local" for the host zone
 ```
 
 `priority: 20` is CPA's plugin load/order priority. The plugin never reads it as an OAuth priority and never mutates credential priority.
@@ -113,10 +115,10 @@ Full deployment instructions: [docs/install-docker-compose.md](docs/install-dock
 2. Restart/reload CPA after changing configuration.
 3. Open Management Center → Plugin Store and refresh.
 4. Install **Account Health Pushover** (`account-health-pushover`).
-5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.1.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
+5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.2.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
 6. Add the two Coolify secret variables and enable the plugin config.
 7. Restart/reload CPA.
-8. Open the read-only plugin status resource, then invoke **Test notification** and **Check now** through CPA's authenticated Management API.
+8. Open **Account Health Pushover** from the Management Center sidebar. When the console is served from the CPA origin with the management key remembered, the page upgrades itself to the authenticated view with **Test notification** and **Check now** buttons; otherwise use the authenticated Management API.
 
 The official CPA registry remains enabled when custom sources are added. See [docs/custom-plugin-store.md](docs/custom-plugin-store.md) for install, update, rollback, and uninstall.
 
@@ -132,7 +134,7 @@ Download the matching release archive plus `checksums.txt`, then verify and inst
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
-unzip account-health-pushover_0.1.0_linux_amd64.zip
+unzip account-health-pushover_0.2.0_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
 docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
@@ -154,17 +156,28 @@ Authenticated by CPA's normal management-key boundary:
 
 ```text
 GET  /v0/management/plugins/account-health-pushover/status
+GET  /v0/management/plugins/account-health-pushover/status/html
 POST /v0/management/plugins/account-health-pushover/check
 POST /v0/management/plugins/account-health-pushover/test
 ```
 
-Browser resource:
+Browser resource (sidebar entry):
 
 ```text
 GET /v0/resource/plugins/account-health-pushover/status
 ```
 
-Current CPA resource routes are unauthenticated by design. Keep port 8317 behind the intended private network/reverse proxy. The resource is read-only, contains no script, never collects a management key, and masks account labels, auth indexes, closed reason diagnostics, notifier errors, monitoring errors, and state paths. It never renders email addresses, raw auth JSON, OAuth tokens, Pushover values, or upstream response bodies. The authenticated Management status endpoint retains exact safe labels/indexes and closed reason codes for operators.
+### Sidebar and browser views
+
+CPA's Management Center lists the resource route as **Account Health Pushover** in its sidebar and iframes it from the CPA origin. Resource routes are unauthenticated in current CPA, so the server response is always the **redacted** view: it masks account labels, auth indexes, closed reason diagnostics, notifier errors, monitoring errors, warnings, and the state path, and it never renders email addresses, raw auth JSON, OAuth tokens, Pushover values, or upstream response bodies.
+
+The redacted page carries a small inline script that upgrades the view purely client-side when the browser already holds a same-origin management session. It recovers the management key that the official management console (Cli-Proxy-API-Management-Center) persists in same-origin localStorage (the console's documented `enc::v1::` reversible obfuscation under `cli-proxy-auth`, or the legacy `managementKey` entry), fetches the authenticated `GET .../status/html` view over the same origin with `Authorization: Bearer`, and swaps it in. This is the same trust model used by the [reset-priority plugin](https://github.com/NoorChasib/cpa-plugin-reset-priority): the upgrade happens entirely in the operator's browser with credentials that browser already holds (a remembered console session, ambient reverse-proxy auth, or cookies), and the key is only ever sent to same-origin CPA management routes. When the console runs on a different origin, or no key is remembered (`Remember password` off) and no ambient auth exists, the fetch fails closed and the redacted view stays up with a short note.
+
+The authenticated HTML view at `GET .../status/html` requires the same management authentication as the JSON route. It shows exact safe labels and auth indexes, closed reason codes, sanitized Pushover/monitoring errors, configuration warnings, the state-file path, per-provider account tables, and **Check now** / **Test notification** buttons. Timestamps are rendered in the configured `display-timezone` as `Tue Sep 1 2026 - 6:25:36 PM PDT`; hover any timestamp for the exact RFC3339 UTC instant. The JSON route always stays RFC3339 UTC.
+
+At the audited CPA revision, management authentication is header-only (`Authorization: Bearer ...` or `X-Management-Key`); a query parameter is not a management credential, and ordinary address-bar navigation cannot add that header. Open the HTML route only through the sidebar upgrade, a browser/profile, or an authenticated reverse proxy that supplies the management header to both the page GET and its same-origin action POSTs.
+
+The two mutating routes are CSRF-gated. Browser requests (those carrying `Sec-Fetch-Site`) are accepted only when the value is `same-origin` or `none` **and** the request includes `X-Account-Health-Action: 1`; `same-site`, `cross-site`, empty metadata, and requests carrying `Origin` without fetch metadata are rejected with HTTP 403. Non-browser clients such as `curl` send neither header and authenticate with the management key alone. A fronting proxy that injects ambient management authentication must still enforce its own CSRF/origin policy for the entire Management API and must pass `Sec-Fetch-Site` unchanged.
 
 Example API actions:
 
@@ -208,6 +221,7 @@ Do not paste the management key into shell history on shared systems; use an env
 | `state-file` | auto | Override persistence path when CPA uses a custom empty auth directory. |
 | `pushover-http-timeout` | `10s` | Timeout per Pushover HTTP attempt. |
 | `max-concurrent-checks` | `4` | Bounded concurrent `host.auth.get_runtime` calls. |
+| `display-timezone` | `UTC` | IANA zone (for example `America/Los_Angeles`) or `local` used to render timestamps on the HTML status view and in Pushover message bodies as `Tue Sep 1 2026 - 6:25:36 PM PDT`. Unknown names fall back to UTC with a status warning. The JSON status route always stays RFC3339 UTC. |
 
 Environment values take precedence over secret files. Direct Pushover values are intentionally not supported as plugin config fields.
 
@@ -246,7 +260,7 @@ make vet
 make test-race
 make build
 make c-shared
-make package-current VERSION=0.1.0
+make package-current VERSION=0.2.0
 make checksums
 make verify-release
 ```
@@ -265,14 +279,14 @@ The smoke build enables a compile-time-only local/mock endpoint seam. Release bu
 
 ## Release assets
 
-A `v0.1.0` tag produces:
+A `v0.2.0` tag produces:
 
 ```text
-account-health-pushover_0.1.0_linux_amd64.zip
-account-health-pushover_0.1.0_linux_arm64.zip
-account-health-pushover_0.1.0_darwin_amd64.zip
-account-health-pushover_0.1.0_darwin_arm64.zip
-account-health-pushover_0.1.0_windows_amd64.zip
+account-health-pushover_0.2.0_linux_amd64.zip
+account-health-pushover_0.2.0_linux_arm64.zip
+account-health-pushover_0.2.0_darwin_amd64.zip
+account-health-pushover_0.2.0_darwin_arm64.zip
+account-health-pushover_0.2.0_windows_amd64.zip
 checksums.txt
 ```
 
@@ -294,6 +308,7 @@ Release procedure: [docs/release.md](docs/release.md).
 [ ] successful reauth sends exactly one recovery alert
 [ ] Test notification succeeds
 [ ] Check now succeeds
+[ ] sidebar entry upgrades to the authenticated view from the console origin
 [ ] status page contains no OAuth/Pushover secrets
 [ ] plugin remains installed after Coolify redeploy/container recreation
 ```
@@ -306,6 +321,7 @@ Release procedure: [docs/release.md](docs/release.md).
 - Pushover response bodies and network error details are never exposed in status.
 - TLS verification is enabled in production, redirects are not followed, and no production endpoint override exists.
 - Account labels are control-character sanitized and bounded before display or notification formatting.
+- The redacted resource page never solicits, embeds, or forwards a management key; its upgrade script only reads a key the same-origin management console already stored and only sends it to same-origin CPA management routes.
 
 Troubleshooting and operator response: [docs/troubleshooting.md](docs/troubleshooting.md).
 

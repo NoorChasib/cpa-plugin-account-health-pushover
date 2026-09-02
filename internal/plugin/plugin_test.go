@@ -820,11 +820,21 @@ func TestManagementRegistrationPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	registration := value.(protocol.ManagementRegistration)
-	if len(registration.Routes) != 3 || len(registration.Resources) != 1 {
+	if len(registration.Routes) != 4 || len(registration.Resources) != 1 {
 		t.Fatalf("management registration=%+v", registration)
 	}
-	if registration.Routes[0].Path != "/plugins/account-health-pushover/status" || registration.Resources[0].Path != "/status" {
+	if registration.Routes[0].Path != "/plugins/account-health-pushover/status" || registration.Routes[1].Path != "/plugins/account-health-pushover/status/html" || registration.Resources[0].Path != "/status" {
 		t.Fatalf("unexpected paths: %+v", registration)
+	}
+	for _, route := range registration.Routes {
+		// Authenticated GET routes must not carry Menu: the host converts
+		// GET+Menu routes into unauthenticated legacy resources.
+		if route.Menu != "" {
+			t.Fatalf("management route %s declares Menu %q; it would become unauthenticated", route.Path, route.Menu)
+		}
+	}
+	if registration.Resources[0].Menu == "" {
+		t.Fatalf("resource route must carry a sidebar Menu label: %+v", registration.Resources[0])
 	}
 }
 
@@ -979,14 +989,152 @@ func TestResourceStatusRedactsAllDiagnosticsAndUsesClosedProviderNames(t *testin
 			t.Fatalf("redacted resource retained %q: %s", forbidden, encoded)
 		}
 	}
-	page := string(renderStatusPage(redacted))
+	page := string(renderStatusPage(redacted, false, time.Now()))
+	for _, forbidden := range []string{secret, "/secret/state/path", "person@example.com", "second@example.com", "secret-index", "other-index"} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("redacted page rendered %q: %s", forbidden, page)
+		}
+	}
 	if !strings.Contains(page, "Claude OAuth account 1") || !strings.Contains(page, "OAuth account 1") {
 		t.Fatalf("provider names were not mapped to the closed display set: %s", page)
 	}
-	if strings.Contains(page, "window.prompt") || strings.Contains(page, "X-Management-Key") || strings.Contains(page, "<script") {
-		t.Fatalf("unauthenticated resource still collects a management key: %s", page)
+	// The resource shell may carry the same-origin upgrade script, but it
+	// must never prompt for, embed, or forward a management key itself.
+	if strings.Contains(page, "window.prompt") || strings.Contains(page, "X-Management-Key") || strings.Contains(page, "Bearer ") {
+		t.Fatalf("unauthenticated resource collects or embeds a management key: %s", page)
 	}
-	if strings.Contains(page, "stale:") || !strings.Contains(page, ">stale<") {
-		t.Fatalf("resource stale marker exposed a dangling diagnostic: %s", page)
+	if !strings.Contains(page, "snapshot stale") || strings.Contains(page, "data-action=") {
+		t.Fatalf("resource page missing stale marker or exposing actions: %s", page)
+	}
+}
+
+func TestResourcePageCarriesSameOriginUpgradeScript(t *testing.T) {
+	host := &pluginFakeHost{}
+	p := configurePlugin(t, host, "")
+	request, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/account-health-pushover/status"})
+	value, err := p.Handle(protocol.MethodManagementHandle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := value.(protocol.ManagementResponse)
+	page := string(response.Body)
+	for _, marker := range []string{
+		"accountHealthAuth",
+		`"cli-proxy-auth"`,
+		`"managementKey"`,
+		`"enc::v1::"`,
+		`managementPath("/status/html")`,
+		`credentials: "same-origin"`,
+		`id="session-note"`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("resource page missing upgrade-script marker %q", marker)
+		}
+	}
+	if strings.Contains(page, "Bearer ") {
+		t.Fatalf("resource page contains contiguous bearer prefix")
+	}
+	csp := strings.Join(response.Headers["content-security-policy"], "")
+	if !strings.Contains(csp, "script-src 'unsafe-inline'") || !strings.Contains(csp, "connect-src 'self'") || !strings.Contains(csp, "frame-ancestors 'self'") {
+		t.Fatalf("content security policy = %q", csp)
+	}
+}
+
+func TestAuthenticatedHTMLViewShowsIdentityActionsAndDisplayTimezone(t *testing.T) {
+	host := &pluginFakeHost{entry: protocol.HostAuthFileEntry{
+		AuthIndex: "idx-one", Provider: "claude", Type: "claude", AccountType: "oauth", Email: "person@example.com", Status: "active", Account: "RAW-ACCOUNT-SECRET",
+	}}
+	t.Setenv(config.DefaultAppTokenEnv, strings.Repeat("A", 30))
+	t.Setenv(config.DefaultUserKeyEnv, strings.Repeat("B", 30))
+	p := New(host, "")
+	request, _ := json.Marshal(protocol.LifecycleRequest{ConfigYAML: []byte(
+		"enabled: true\nstartup-grace: 24h\nscan-interval: 24h\nnotification-coalesce-window: 0\ndisplay-timezone: America/Los_Angeles\nstate-file: " + filepath.Join(t.TempDir(), "state.json") + "\n",
+	), SchemaVersion: protocol.SchemaVersion})
+	if _, err := p.Handle(protocol.MethodPluginRegister, request); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Shutdown)
+	p.now = func() time.Time { return time.Date(2026, time.September, 2, 1, 25, 36, 0, time.UTC) }
+
+	checkRequest, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/account-health-pushover/check"})
+	if _, err := p.Handle(protocol.MethodManagementHandle, checkRequest); err != nil {
+		t.Fatal(err)
+	}
+	htmlRequest, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/account-health-pushover/status/html"})
+	value, err := p.Handle(protocol.MethodManagementHandle, htmlRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := value.(protocol.ManagementResponse)
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(strings.Join(response.Headers["content-type"], ""), "text/html") {
+		t.Fatalf("authenticated html response status=%d headers=%v", response.StatusCode, response.Headers)
+	}
+	page := string(response.Body)
+	for _, expected := range []string{
+		"person@example.com",
+		"<code>idx-one</code>",
+		`data-action="check"`,
+		`data-action="test"`,
+		"X-Account-Health-Action",
+		"Tue Sep 1 2026",
+		"6:25:36 PM PDT",
+		"Times shown in America/Los_Angeles",
+		`datetime="2026-09-02T01:25:36Z"`,
+	} {
+		if !strings.Contains(page, expected) {
+			t.Fatalf("authenticated view missing %q: %s", expected, page)
+		}
+	}
+	if strings.Contains(page, host.entry.Account) || strings.Contains(page, "Bearer ") {
+		t.Fatalf("authenticated view leaked raw account data or bearer prefix: %s", page)
+	}
+
+	// The same suffix under the resource tree must stay redacted and unauthenticated.
+	resourceHTML, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/account-health-pushover/status/html"})
+	value, err = p.Handle(protocol.MethodManagementHandle, resourceHTML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := string(value.(protocol.ManagementResponse).Body); strings.Contains(body, "person@example.com") || strings.Contains(body, "idx-one") || strings.Contains(body, "data-action=") {
+		t.Fatalf("resource-tree html path was not redacted: %s", body)
+	}
+}
+
+func TestManagementActionsRejectCrossSiteBrowserRequests(t *testing.T) {
+	host := &pluginFakeHost{}
+	p := configurePlugin(t, host, "")
+	call := func(path string, headers http.Header) int {
+		t.Helper()
+		request, _ := json.Marshal(protocol.ManagementRequest{Method: http.MethodPost, Path: path, Headers: headers})
+		value, err := p.Handle(protocol.MethodManagementHandle, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value.(protocol.ManagementResponse).StatusCode
+	}
+	check := "/v0/management/plugins/account-health-pushover/check"
+	test := "/v0/management/plugins/account-health-pushover/test"
+	rejected := []http.Header{
+		{"Sec-Fetch-Site": {"cross-site"}, "X-Account-Health-Action": {"1"}},
+		{"Sec-Fetch-Site": {"same-site"}, "X-Account-Health-Action": {"1"}},
+		{"Sec-Fetch-Site": {"same-origin"}},
+		{"Sec-Fetch-Site": {""}, "X-Account-Health-Action": {"1"}},
+		{"Origin": {"https://evil.example"}},
+	}
+	for _, headers := range rejected {
+		for _, path := range []string{check, test} {
+			if status := call(path, headers); status != http.StatusForbidden {
+				t.Fatalf("%s with %v = %d, want 403", path, headers, status)
+			}
+		}
+	}
+	if status := call(check, http.Header{"Sec-Fetch-Site": {"same-origin"}, "X-Account-Health-Action": {"1"}}); status != http.StatusOK {
+		t.Fatalf("same-origin browser check = %d, want 200", status)
+	}
+	if status := call(check, http.Header{"Sec-Fetch-Site": {"none"}, "X-Account-Health-Action": {"1"}}); status != http.StatusOK {
+		t.Fatalf("navigation-origin browser check = %d, want 200", status)
+	}
+	if status := call(check, nil); status != http.StatusOK {
+		t.Fatalf("header-only non-browser check = %d, want 200", status)
 	}
 }

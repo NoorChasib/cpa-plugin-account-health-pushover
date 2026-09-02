@@ -19,9 +19,16 @@ import (
 const (
 	ID                        = "account-health-pushover"
 	defaultMonitorStopTimeout = 5 * time.Second
+
+	// actionRequestHeader makes browser-originated mutating requests non-simple
+	// so an ambient reverse-proxy management credential cannot be ridden by a
+	// cross-origin HTML form POST. Non-browser clients (no Origin and no fetch
+	// metadata) authenticate with the management key alone.
+	actionRequestHeader      = "X-Account-Health-Action"
+	actionRequestHeaderValue = "1"
 )
 
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 type Host = monitor.Host
 
@@ -36,6 +43,7 @@ type usageFailureRecord struct {
 type Plugin struct {
 	host     Host
 	endpoint string
+	now      func() time.Time
 
 	lifecycleMu            sync.Mutex
 	mu                     sync.RWMutex
@@ -53,6 +61,7 @@ func New(host Host, endpoint string) *Plugin {
 	return &Plugin{
 		host:                   host,
 		endpoint:               endpoint,
+		now:                    time.Now,
 		monitorStopTimeout:     defaultMonitorStopTimeout,
 		managementCheckTimeout: 30 * time.Second,
 	}
@@ -191,6 +200,7 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 	if method == "" {
 		method = http.MethodGet
 	}
+	authenticatedRoute := strings.Contains(path, "/management/plugins/") && !strings.Contains(path, "/v0/resource/")
 	p.mu.RLock()
 	current := p.monitor
 	transitioning := p.transitioning
@@ -202,12 +212,26 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 		return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": "plugin is not configured"}), nil
 	}
 	switch {
+	case method == http.MethodGet && strings.HasSuffix(path, "/status/html"):
+		// Authenticated browser view. The host has already enforced management
+		// authentication for /v0/management routes; anything else (including an
+		// unexpected resource-tree path) gets the redacted page instead.
+		if authenticatedRoute {
+			return htmlResponse(http.StatusOK, renderStatusPage(current.Snapshot(), true, p.now())), nil
+		}
+		return htmlResponse(http.StatusOK, renderStatusPage(redactResourceStatus(current.Snapshot()), false, p.now())), nil
 	case method == http.MethodGet && strings.HasSuffix(path, "/status"):
-		if strings.Contains(path, "/management/plugins/") {
+		if authenticatedRoute {
 			return jsonResponse(http.StatusOK, current.Snapshot()), nil
 		}
-		return htmlResponse(http.StatusOK, renderStatusPage(redactResourceStatus(current.Snapshot()))), nil
+		// Unauthenticated resource page: redacted snapshot only. Its inline
+		// script may upgrade the view client-side with credentials the browser
+		// already holds; the server never authenticates this response.
+		return htmlResponse(http.StatusOK, renderStatusPage(redactResourceStatus(current.Snapshot()), false, p.now())), nil
 	case method == http.MethodPost && strings.HasSuffix(path, "/check"):
+		if !actionRequestAllowed(request.Headers) {
+			return actionForbiddenResponse(), nil
+		}
 		if p.beforeManagementCheck != nil {
 			p.beforeManagementCheck()
 		}
@@ -229,6 +253,9 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 		}
 		return jsonResponse(http.StatusOK, status), nil
 	case method == http.MethodPost && strings.HasSuffix(path, "/test"):
+		if !actionRequestAllowed(request.Headers) {
+			return actionForbiddenResponse(), nil
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), current.NotificationTimeout())
 		result := current.TestNotification(ctx)
 		cancel()
@@ -244,6 +271,77 @@ func (p *Plugin) handleManagement(raw []byte) (protocol.ManagementResponse, erro
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "route not found"}), nil
 	}
+}
+
+// actionRequestAllowed gates the mutating management actions against browser
+// cross-site requests. A request carrying browser fetch metadata must be
+// same-origin (or a top-level navigation, "none") and must include the plugin
+// action header; a request carrying Origin without fetch metadata is rejected.
+// Non-browser clients send neither header and pass on the management key alone.
+func actionRequestAllowed(headers http.Header) bool {
+	fetchSite, hasFetchSite := headerTokens(headers, "Sec-Fetch-Site")
+	if hasFetchSite {
+		if len(fetchSite) == 0 {
+			return false
+		}
+		for _, site := range fetchSite {
+			if !strings.EqualFold(site, "same-origin") && !strings.EqualFold(site, "none") {
+				return false
+			}
+		}
+		return headerHasToken(headers, actionRequestHeader, actionRequestHeaderValue)
+	}
+	return !headerPresent(headers, "Origin")
+}
+
+func headerHasToken(headers http.Header, name, token string) bool {
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(part), token) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func headerTokens(headers http.Header, name string) ([]string, bool) {
+	var tokens []string
+	present := false
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		present = true
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				if token := strings.TrimSpace(part); token != "" {
+					tokens = append(tokens, token)
+				}
+			}
+		}
+	}
+	return tokens, present
+}
+
+func headerPresent(headers http.Header, name string) bool {
+	for key := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return true
+		}
+	}
+	return false
+}
+
+func actionForbiddenResponse() protocol.ManagementResponse {
+	return jsonResponse(http.StatusForbidden, map[string]any{
+		"error": "browser requests must be same-origin and include the " + actionRequestHeader + " header",
+	})
 }
 
 func lifecycleRetryResponse() protocol.ManagementResponse {
@@ -277,6 +375,7 @@ func managementRegistration() protocol.ManagementRegistration {
 	return protocol.ManagementRegistration{
 		Routes: []protocol.ManagementRoute{
 			{Method: http.MethodGet, Path: base + "/status", Description: "Returns sanitized account-health and notifier status."},
+			{Method: http.MethodGet, Path: base + "/status/html", Description: "Authenticated browser status view with Check now and Test notification actions."},
 			{Method: http.MethodPost, Path: base + "/check", Description: "Runs an immediate health reconciliation."},
 			{Method: http.MethodPost, Path: base + "/test", Description: "Sends a safe Pushover test notification."},
 		},
@@ -314,6 +413,7 @@ func configFields() []protocol.ConfigField {
 		field("state-file", "string", "Optional state file override; defaults below the detected CPA auth directory."),
 		field("pushover-http-timeout", "string", "Timeout for each Pushover HTTP request (default 10s)."),
 		field("max-concurrent-checks", "integer", "Maximum concurrent host runtime reads (default 4)."),
+		field("display-timezone", "string", "IANA time zone for timestamps on the status page and in Pushover messages, e.g. America/Los_Angeles, or \"local\" for the host zone (default UTC). Presentation only."),
 	}
 }
 
@@ -339,7 +439,7 @@ func htmlResponse(status int, body []byte) protocol.ManagementResponse {
 		Headers: http.Header{
 			"content-type":            []string{"text/html; charset=utf-8"},
 			"cache-control":           []string{"no-store"},
-			"content-security-policy": []string{"default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'"},
+			"content-security-policy": []string{"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"},
 			"x-content-type-options":  []string{"nosniff"},
 			"referrer-policy":         []string{"no-referrer"},
 		},

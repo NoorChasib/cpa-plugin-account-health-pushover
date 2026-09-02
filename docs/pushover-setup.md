@@ -71,7 +71,7 @@ Priority `1` is high priority and bypasses quiet hours. Recovery priority `0` is
 
 ## Test
 
-The browser status resource is intentionally read-only and never collects a management key. Invoke the authenticated Management API:
+Use the **Test notification** button on the authenticated status page (opened from the Management Center sidebar with a same-origin console session), or invoke the authenticated Management API:
 
 ```bash
 curl -X POST \

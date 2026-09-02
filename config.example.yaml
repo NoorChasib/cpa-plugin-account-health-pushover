@@ -38,3 +38,5 @@ plugins:
       state-file: "" # Defaults to <detected CPA auth dir>/.plugin-state/account-health-pushover/state.json.
       pushover-http-timeout: 10s
       max-concurrent-checks: 4
+
+      display-timezone: UTC # Status page and Pushover timestamps; e.g. America/Los_Angeles, or "local" for the host zone.
