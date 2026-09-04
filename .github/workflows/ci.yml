@@ -33,7 +33,7 @@ jobs:
       - name: Build native plugin
         run: make c-shared
       - name: Package current platform
-        run: make package-current VERSION=0.3.0
+        run: make package-current VERSION=0.3.1
       - name: Generate checksums
         run: make checksums
       - name: Verify packaged archive and checksums (partial bundle)

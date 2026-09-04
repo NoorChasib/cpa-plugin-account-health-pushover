@@ -1510,7 +1510,7 @@ func TestStateLoadWaitsForDiscoveredAuthDirectory(t *testing.T) {
 	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
 	mock := newMockPushover(t)
 	authDir := t.TempDir()
-	statePath := filepath.Join(authDir, ".plugin-state", "account-health-pushover", "state.json")
+	statePath := state.DefaultPath(authDir)
 	data := state.NewData()
 	firstDetected := time.Now().UTC().Add(-time.Hour)
 	data.Accounts["claude:one"] = &state.Account{
@@ -1547,6 +1547,110 @@ func TestStateLoadWaitsForDiscoveredAuthDirectory(t *testing.T) {
 	status := monitor.Snapshot()
 	if status.StateFile != statePath || status.Accounts[0].Health != health.Healthy || !strings.Contains(mock.all(), "account recovered") {
 		t.Fatalf("persisted incident was not loaded from discovered auth directory: status=%+v messages=%s", status, mock.all())
+	}
+}
+
+func TestStateLoadIgnoresOwnStateFileInRoster(t *testing.T) {
+	// Regression for the nesting bug: CPA lists the plugin's own state file as
+	// an "Other" auth entry sorted ahead of real credentials. That entry must
+	// not seed auth-directory detection, and a legacy state.json (including the
+	// nested copies the bug produced) must be adopted and cleaned up.
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	mock := newMockPushover(t)
+	authDir := t.TempDir()
+	stateDir := filepath.Join(authDir, ".plugin-state", "account-health-pushover")
+	nestedDir := filepath.Join(stateDir, ".plugin-state", "account-health-pushover")
+	legacy := state.NewData()
+	legacy.Accounts["claude:one"] = &state.Account{
+		AccountKey:         "claude:one",
+		Provider:           "claude",
+		AuthIndex:          "one",
+		Label:              "a@example.com",
+		Health:             health.ReauthRequired,
+		FirstDetectedAt:    time.Now().UTC().Add(-time.Hour),
+		AlertSent:          true,
+		IncidentGeneration: 7,
+	}
+	for _, dir := range []string{stateDir, nestedDir} {
+		if err := (state.Store{Path: filepath.Join(dir, state.LegacyFileName)}).Save(legacy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	monitor := newConfiguredTestMonitor(t, host, mock, func(cfg *config.Config) {
+		cfg.StateFile = ""
+		cfg.NotificationCoalesceWindow = 0
+	})
+
+	stateEntry := protocol.HostAuthFileEntry{
+		Name:   ".plugin-state/account-health-pushover/state.json",
+		Type:   "",
+		Source: "file",
+		Path:   filepath.Join(stateDir, state.LegacyFileName),
+	}
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{stateEntry}
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "state-only-roster"); err != nil {
+		t.Fatal(err)
+	}
+	if got := monitor.Snapshot().StateFileHealth; got != "waiting_for_auth_path" {
+		t.Fatalf("state-only roster: health=%q, want waiting_for_auth_path", got)
+	}
+
+	entry := oauthEntry("one", "claude", "a@example.com", "active", "", false)
+	entry.Path = filepath.Join(authDir, "claude-one.json")
+	host.mu.Lock()
+	host.roster = []protocol.HostAuthFileEntry{stateEntry, entry}
+	host.runtime[entry.AuthIndex] = entry
+	host.mu.Unlock()
+	if err := monitor.Reconcile(context.Background(), "auth-discovered"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return mock.count() == 1 })
+	status := monitor.Snapshot()
+	if status.StateFile != state.DefaultPath(authDir) {
+		t.Fatalf("state path %q derived from plugin-state entry", status.StateFile)
+	}
+	if status.StateFileHealth != "healthy" || len(status.Warnings) != 0 {
+		t.Fatalf("status=%+v", status)
+	}
+	if status.Accounts[0].Health != health.Healthy || !strings.Contains(mock.all(), "account recovered") {
+		t.Fatalf("legacy incident was not migrated: status=%+v messages=%s", status, mock.all())
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, ".plugin-state")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("nested legacy tree remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, state.LegacyFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy state.json remains: %v", err)
+	}
+	if _, err := os.Stat(status.StateFile); err != nil {
+		t.Fatalf("new state file missing: %v", err)
+	}
+}
+
+func TestStateFileInsideAuthDirWithJSONNameWarns(t *testing.T) {
+	host := &fakeHost{runtime: make(map[string]protocol.HostAuthFileEntry), runtimeErr: make(map[string]error)}
+	mock := newMockPushover(t)
+	authDir := t.TempDir()
+	entry := oauthEntry("one", "claude", "a@example.com", "active", "", false)
+	entry.Path = filepath.Join(authDir, "claude-one.json")
+	host.set(entry)
+	monitor := newConfiguredTestMonitor(t, host, mock, func(cfg *config.Config) {
+		cfg.StateFile = filepath.Join(authDir, "custom", "state.json")
+		cfg.NotificationCoalesceWindow = 0
+	})
+	if err := monitor.Reconcile(context.Background(), "test"); err != nil {
+		t.Fatal(err)
+	}
+	status := monitor.Snapshot()
+	if len(status.Warnings) != 1 || !strings.Contains(status.Warnings[0], "auth directory") {
+		t.Fatalf("warnings=%v", status.Warnings)
+	}
+	if err := monitor.Reconcile(context.Background(), "again"); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(monitor.Snapshot().Warnings); got != 1 {
+		t.Fatalf("warning duplicated: %d", got)
 	}
 }
 

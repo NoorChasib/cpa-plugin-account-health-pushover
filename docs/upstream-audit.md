@@ -144,13 +144,20 @@ The plugin does not call `host.auth.get` to fill the gap. That callback returns 
 
 ## Persistence facility
 
-The audited plugin ABI has no plugin-specific data-directory callback. The implementation derives the state location from the first monitored auth file path:
+The audited plugin ABI has no plugin-specific data-directory callback. The implementation derives the state location from the first real credential path in the host roster:
 
 ```text
-<auth-dir>/.plugin-state/account-health-pushover/state.json
+<auth-dir>/.plugin-state/account-health-pushover/state.ahp
 ```
 
 Without an explicit override, state loading waits until the host roster exposes at least one auth-file path, then stores beneath that path's directory. This prevents a transient empty startup roster from permanently latching to the process-home fallback. Operators whose custom auth directory can remain empty should set `state-file` explicitly. This is the only extra config field required because upstream does not expose a host-approved plugin data directory during registration.
+
+Re-audited 2026-09-04 against CPA v7.2.149 (`2a6b87aca083a5bf498ac1f68a1b636c500d7aaa`): `sdk/auth/filestore.go` `FileTokenStore.List` enumerates the auth directory with `filepath.WalkDir`, so every `*.json` at any depth beneath it becomes an auth entry, and `host.auth.list` returns those entries sorted by lowercased name. Two consequences shape the persistence design:
+
+- the state file name must not end in `.json`, otherwise CPA lists it as an "Other" credential;
+- roster entries whose path contains a `.plugin-state` component are excluded from auth-directory detection, because `.plugin-state/...` sorts ahead of every real credential and would otherwise seed the state path from the plugin's own file (the 0.3.0 nesting bug).
+
+The legacy top-level-only scan in `internal/watcher` (`os.ReadDir`, `entry.IsDir()` skip) still exists but is not the path `host.auth.list` uses when an auth manager is active.
 
 ## Management routes
 

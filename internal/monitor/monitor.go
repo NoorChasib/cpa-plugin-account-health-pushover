@@ -687,22 +687,19 @@ func (m *Monitor) ensureStateLoaded(ctx context.Context, roster []protocol.HostA
 	if m.stateLoaded {
 		return false, nil
 	}
-	if strings.TrimSpace(m.cfg.StateFile) == "" {
-		hasAuthPath := false
-		for _, entry := range roster {
-			if strings.TrimSpace(entry.Path) != "" {
-				hasAuthPath = true
-				break
-			}
-		}
-		if !hasAuthPath {
-			m.status.StateFile = ""
-			m.status.StateFileHealth = "waiting_for_auth_path"
-			return false, nil
-		}
+	// Plugin-owned files that CPA lists beneath the auth directory are never
+	// auth-directory evidence; only a real credential path may seed detection.
+	authDir := state.AuthDirectoryFromRoster(roster)
+	if strings.TrimSpace(m.cfg.StateFile) == "" && authDir == "" {
+		m.status.StateFile = ""
+		m.status.StateFileHealth = "waiting_for_auth_path"
+		return false, nil
 	}
 	m.store = state.Store{Path: state.ResolvePath(m.cfg.StateFile, roster)}
 	m.status.StateFile = m.store.Path
+	if state.ListedAsCredential(m.store.Path, authDir) {
+		m.addWarningLocked(stateFileListedWarning)
+	}
 
 	// A replacement monitor may encounter an old writer whose validated commit
 	// is still in flight. Bound lease acquisition by both the caller and monitor
@@ -731,6 +728,11 @@ func (m *Monitor) ensureStateLoaded(ctx context.Context, roster []protocol.HostA
 		m.status.StateFileHealth = "writer_claim_stopping"
 		return false, ErrStopping
 	}
+	if migrated, migrateErr := m.store.MigrateLegacy(); migrateErr != nil {
+		m.host.Log(ctx, "warn", "account-health legacy state migration failed", map[string]any{"migrated": migrated})
+	} else if migrated {
+		m.host.Log(ctx, "info", "account-health state migrated from legacy state.json", nil)
+	}
 	data, err := m.store.Load()
 	if err != nil {
 		m.data = state.NewData()
@@ -741,6 +743,18 @@ func (m *Monitor) ensureStateLoaded(ctx context.Context, roster []protocol.HostA
 	}
 	m.stateLoaded = true
 	return err != nil, nil
+}
+
+const stateFileListedWarning = "state-file is a .json file beneath the CPA auth directory; CPA lists it as an \"Other\" auth file. Point state-file outside the auth directory or use a non-.json name."
+
+// addWarningLocked appends a status warning once. Caller holds stateMu.
+func (m *Monitor) addWarningLocked(message string) {
+	for _, existing := range m.status.Warnings {
+		if existing == message {
+			return
+		}
+	}
+	m.status.Warnings = append(m.status.Warnings, message)
 }
 
 func (m *Monitor) applyObservation(snapshot health.RuntimeSnapshot, observation health.Observation, activeKeys map[string]struct{}, identityCounts map[string]int, now time.Time) {

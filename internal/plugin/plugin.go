@@ -29,7 +29,7 @@ const (
 	actionRequestHeaderValue = "1"
 )
 
-var Version = "0.3.0"
+var Version = "0.3.1"
 
 type Host = monitor.Host
 
@@ -443,7 +443,7 @@ func configFields() []protocol.ConfigField {
 		field("pushover-user-key-file", "string", "Optional Docker/Kubernetes secret file containing the user/group key."),
 		field("pushover-device", "string", "Optional Pushover device target; blank sends to all active devices."),
 		field("management-url", "string", "Optional private CPA Management URL appended to incident alerts."),
-		field("state-file", "string", "Optional state file override; defaults below the detected CPA auth directory."),
+		field("state-file", "string", "Optional state file override; defaults to <auth dir>/.plugin-state/account-health-pushover/state.ahp. Avoid *.json paths beneath the auth directory, which CPA lists as credentials."),
 		field("pushover-http-timeout", "string", "Timeout for each Pushover HTTP request (default 10s)."),
 		field("max-concurrent-checks", "integer", "Maximum concurrent host runtime reads (default 4)."),
 		field("display-timezone", "string", "IANA time zone for timestamps on the status page and in Pushover messages, e.g. America/Los_Angeles, or \"local\" for the host zone (default UTC). Presentation only."),

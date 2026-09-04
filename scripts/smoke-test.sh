@@ -96,7 +96,6 @@ plugins:
       startup-grace: 100ms
       transient-confirm-after: 1s
       notification-coalesce-window: 0
-      state-file: "/tmp/cpa-smoke-auth/.plugin-state/account-health-pushover/state.json"
       pushover-app-token-env: CPA_PUSHOVER_APP_TOKEN
       pushover-user-key-env: CPA_PUSHOVER_USER_KEY
 YAML

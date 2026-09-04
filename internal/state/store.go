@@ -301,6 +301,18 @@ func (s Store) Load() (Data, error) {
 	if err != nil {
 		return data, fmt.Errorf("read state file: %w", err)
 	}
+	data, err = decode(raw)
+	if err != nil {
+		return data, err
+	}
+	applySuppressionRollbacks(s.Path, &data)
+	return data, nil
+}
+
+// decode parses and normalizes a persisted state payload. It never returns
+// partial data: any decode or version failure yields an empty state.
+func decode(raw []byte) (Data, error) {
+	data := NewData()
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return NewData(), fmt.Errorf("decode state file: %w", err)
 	}
@@ -332,7 +344,6 @@ func (s Store) Load() (Data, error) {
 	if data.LastNotificationErr != "" {
 		data.LastNotificationErr = "previous notification delivery failed"
 	}
-	applySuppressionRollbacks(s.Path, &data)
 	return data, nil
 }
 
@@ -401,6 +412,78 @@ func (s Store) Save(data Data) error {
 	return nil
 }
 
+// FileName is the default state file name. Its content is JSON, but the name
+// deliberately does not end in ".json": current CPA loads every *.json file
+// beneath the auth directory (recursively) as a credential, and the default
+// state location lives beneath that directory.
+const FileName = "state.ahp"
+
+// LegacyFileName is the pre-0.3.1 default state file name. CPA listed it as an
+// "Other" auth file and, because the plugin derived its state directory from
+// that listing, each restart nested a fresh copy one level deeper.
+const LegacyFileName = "state.json"
+
+const (
+	stateDirName   = ".plugin-state"
+	pluginDirName  = "account-health-pushover"
+	legacyMaxDepth = 32
+)
+
+// DefaultPath returns the default state path beneath authDir.
+func DefaultPath(authDir string) string {
+	return filepath.Join(authDir, stateDirName, pluginDirName, FileName)
+}
+
+// IsPluginStatePath reports whether path has a ".plugin-state" component, i.e.
+// it is a plugin-owned file that CPA listed as an auth file rather than a real
+// credential. Such entries must never seed the auth-directory detection.
+func IsPluginStatePath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	normalized := strings.ReplaceAll(filepath.ToSlash(path), "\\", "/")
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == stateDirName {
+			return true
+		}
+	}
+	return false
+}
+
+// AuthDirectoryFromRoster returns the directory of the first roster entry that
+// is a real on-disk auth file, or "" when the roster exposes none.
+func AuthDirectoryFromRoster(roster []protocol.HostAuthFileEntry) string {
+	for _, entry := range roster {
+		path := strings.TrimSpace(entry.Path)
+		if path == "" || IsPluginStatePath(path) {
+			continue
+		}
+		return filepath.Dir(path)
+	}
+	return ""
+}
+
+// ListedAsCredential reports whether CPA would enumerate path as an auth file:
+// a *.json file anywhere beneath authDir.
+func ListedAsCredential(path, authDir string) bool {
+	path = strings.TrimSpace(path)
+	authDir = strings.TrimSpace(authDir)
+	if path == "" || authDir == "" || !strings.HasSuffix(strings.ToLower(path), ".json") {
+		return false
+	}
+	absPath, errPath := filepath.Abs(path)
+	absDir, errDir := filepath.Abs(authDir)
+	if errPath != nil || errDir != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func ResolvePath(configured string, roster []protocol.HostAuthFileEntry) string {
 	if configured = strings.TrimSpace(configured); configured != "" {
 		if filepath.IsAbs(configured) {
@@ -412,16 +495,72 @@ func ResolvePath(configured string, roster []protocol.HostAuthFileEntry) string 
 		}
 		return configured
 	}
-	for _, entry := range roster {
-		if strings.TrimSpace(entry.Path) != "" {
-			return filepath.Join(filepath.Dir(entry.Path), ".plugin-state", "account-health-pushover", "state.json")
-		}
+	if authDir := AuthDirectoryFromRoster(roster); authDir != "" {
+		return DefaultPath(authDir)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return filepath.Join(".plugin-state", "account-health-pushover", "state.json")
+		return filepath.Join(stateDirName, pluginDirName, FileName)
 	}
-	return filepath.Join(home, ".cli-proxy-api", ".plugin-state", "account-health-pushover", "state.json")
+	return DefaultPath(filepath.Join(home, ".cli-proxy-api"))
+}
+
+// MigrateLegacy adopts a pre-0.3.1 state.json for a store at the default
+// location. It considers the legacy file beside s.Path plus every nested copy
+// the old nesting bug produced beneath it, keeps the newest, writes it to
+// s.Path, and then removes the legacy file and the nested tree. Nothing is
+// touched when s.Path already exists or no legacy file is present. The caller
+// must hold the writer lease (Claim) because the adoption is a Save.
+func (s Store) MigrateLegacy() (bool, error) {
+	if strings.TrimSpace(s.Path) == "" {
+		return false, errors.New("state file path is not configured")
+	}
+	if _, err := os.Stat(s.Path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat state file: %w", err)
+	}
+	dir := filepath.Dir(s.Path)
+	var newestPath string
+	var newestTime time.Time
+	current := dir
+	for depth := 0; depth < legacyMaxDepth; depth++ {
+		candidate := filepath.Join(current, LegacyFileName)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			if newestPath == "" || info.ModTime().After(newestTime) {
+				newestPath, newestTime = candidate, info.ModTime()
+			}
+		}
+		current = filepath.Join(current, stateDirName, pluginDirName)
+		if info, err := os.Stat(current); err != nil || !info.IsDir() {
+			break
+		}
+	}
+	if newestPath == "" {
+		return false, nil
+	}
+	raw, err := os.ReadFile(newestPath)
+	if err != nil {
+		return false, fmt.Errorf("read legacy state file: %w", err)
+	}
+	data, err := decode(raw)
+	if err != nil {
+		return false, fmt.Errorf("legacy state file %s: %w", filepath.Base(newestPath), err)
+	}
+	if err := s.Save(data); err != nil {
+		return false, err
+	}
+	var cleanupErr error
+	if err := os.Remove(filepath.Join(dir, LegacyFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		cleanupErr = err
+	}
+	if err := os.RemoveAll(filepath.Join(dir, stateDirName)); err != nil && cleanupErr == nil {
+		cleanupErr = err
+	}
+	if cleanupErr != nil {
+		return true, fmt.Errorf("remove legacy state files: %w", cleanupErr)
+	}
+	return true, nil
 }
 
 func PruneRemoved(data *Data, now time.Time, retention time.Duration) int {

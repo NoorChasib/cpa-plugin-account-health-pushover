@@ -545,12 +545,171 @@ func TestPruneRemovedRetention(t *testing.T) {
 func TestResolvePathUsesAuthDirectoryAndOverride(t *testing.T) {
 	roster := []protocol.HostAuthFileEntry{{Path: "/root/.cli-proxy-api/claude.json"}}
 	got := ResolvePath("", roster)
-	want := "/root/.cli-proxy-api/.plugin-state/account-health-pushover/state.json"
+	want := "/root/.cli-proxy-api/.plugin-state/account-health-pushover/state.ahp"
 	if got != want {
 		t.Fatalf("path = %q, want %q", got, want)
 	}
 	override := filepath.Join(t.TempDir(), "custom.json")
 	if got := ResolvePath(override, roster); got != override {
 		t.Fatalf("override = %q", got)
+	}
+}
+
+func TestDefaultStateFileIsNotAJSONCredentialCandidate(t *testing.T) {
+	// Current CPA lists every *.json beneath the auth directory as an auth
+	// file, so the default state name must never end in .json.
+	if strings.HasSuffix(strings.ToLower(FileName), ".json") {
+		t.Fatalf("default state file %q would be listed by CPA as a credential", FileName)
+	}
+	if ListedAsCredential(DefaultPath("/root/.cli-proxy-api"), "/root/.cli-proxy-api") {
+		t.Fatal("default path reported as credential-listed")
+	}
+	if !ListedAsCredential("/root/.cli-proxy-api/.plugin-state/x/state.json", "/root/.cli-proxy-api") {
+		t.Fatal("nested .json beneath auth dir was not reported")
+	}
+	if ListedAsCredential("/CLIProxyAPI/plugins/ahp/state.json", "/root/.cli-proxy-api") {
+		t.Fatal(".json outside auth dir was reported")
+	}
+	if ListedAsCredential("/root/.cli-proxy-api-other/state.json", "/root/.cli-proxy-api") {
+		t.Fatal("sibling directory with shared prefix was reported")
+	}
+}
+
+func TestResolvePathIgnoresPluginStateRosterEntries(t *testing.T) {
+	// Regression: CPA sorts the roster by name and ".plugin-state/..." sorts
+	// before every real credential, so the old resolver latched onto its own
+	// state file and nested a new directory on every restart.
+	nested := "/root/.cli-proxy-api/.plugin-state/account-health-pushover/state.json"
+	roster := []protocol.HostAuthFileEntry{
+		{Name: ".plugin-state/account-health-pushover/state.json", Path: nested},
+		{Name: "claude-a.json", Path: "/root/.cli-proxy-api/claude-a.json"},
+	}
+	if got := AuthDirectoryFromRoster(roster); got != "/root/.cli-proxy-api" {
+		t.Fatalf("auth dir = %q", got)
+	}
+	if got := ResolvePath("", roster); got != DefaultPath("/root/.cli-proxy-api") {
+		t.Fatalf("path = %q", got)
+	}
+	onlyState := roster[:1]
+	if got := AuthDirectoryFromRoster(onlyState); got != "" {
+		t.Fatalf("plugin-state-only roster produced auth dir %q", got)
+	}
+	for _, path := range []string{nested, `C:\auth\.plugin-state\x\state.json`, ".plugin-state/x"} {
+		if !IsPluginStatePath(path) {
+			t.Fatalf("%q not recognised as plugin state", path)
+		}
+	}
+	if IsPluginStatePath("/root/.cli-proxy-api/claude.json") || IsPluginStatePath("") {
+		t.Fatal("credential path recognised as plugin state")
+	}
+}
+
+func TestMigrateLegacyAdoptsNewestNestedStateAndRemovesTree(t *testing.T) {
+	authDir := t.TempDir()
+	store := Store{Path: DefaultPath(authDir)}
+	base := filepath.Dir(store.Path)
+	writeLegacy := func(dir string, generation uint64, mod time.Time) string {
+		t.Helper()
+		data := NewData()
+		data.Accounts["claude:one"] = &Account{AccountKey: "claude:one", Provider: "claude", AuthIndex: "one", Health: health.ReauthRequired, AlertSent: true, IncidentGeneration: generation}
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, LegacyFileName)
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	now := time.Now()
+	writeLegacy(base, 1, now.Add(-3*time.Hour))
+	level2 := filepath.Join(base, stateDirName, pluginDirName)
+	writeLegacy(level2, 2, now.Add(-2*time.Hour))
+	level3 := filepath.Join(level2, stateDirName, pluginDirName)
+	writeLegacy(level3, 3, now.Add(-time.Hour))
+
+	if err := store.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Release()
+	migrated, err := store.MigrateLegacy()
+	if err != nil || !migrated {
+		t.Fatalf("migrated=%v err=%v", migrated, err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account := loaded.Accounts["claude:one"]; account == nil || account.IncidentGeneration != 3 || !account.AlertSent {
+		t.Fatalf("newest nested state was not adopted: %+v", account)
+	}
+	if _, err := os.Stat(filepath.Join(base, LegacyFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy state.json remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, stateDirName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("nested plugin-state tree remains: %v", err)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != FileName {
+		t.Fatalf("unexpected state directory contents: %v", entries)
+	}
+
+	again, err := store.MigrateLegacy()
+	if err != nil || again {
+		t.Fatalf("second migration migrated=%v err=%v", again, err)
+	}
+}
+
+func TestMigrateLegacyIsNoopWithoutLegacyFileOrWhenCurrentExists(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "s", FileName)}
+	migrated, err := store.MigrateLegacy()
+	if err != nil || migrated {
+		t.Fatalf("empty dir: migrated=%v err=%v", migrated, err)
+	}
+	if err := store.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Release()
+	if err := store.Save(NewData()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(store.Path), LegacyFileName), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err = store.MigrateLegacy()
+	if err != nil || migrated {
+		t.Fatalf("current present: migrated=%v err=%v", migrated, err)
+	}
+}
+
+func TestMigrateLegacyRejectsCorruptLegacyFileWithoutTouchingIt(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "s", FileName)}
+	dir := filepath.Dir(store.Path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(dir, LegacyFileName)
+	if err := os.WriteFile(legacy, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := store.MigrateLegacy()
+	if err == nil || migrated {
+		t.Fatalf("corrupt legacy: migrated=%v err=%v", migrated, err)
+	}
+	if _, statErr := os.Stat(legacy); statErr != nil {
+		t.Fatalf("corrupt legacy file was removed: %v", statErr)
+	}
+	if _, statErr := os.Stat(store.Path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("state file was created from corrupt input: %v", statErr)
 	}
 }

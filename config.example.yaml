@@ -36,7 +36,7 @@ plugins:
       pushover-device: ""
 
       management-url: ""
-      state-file: "" # Defaults to <detected CPA auth dir>/.plugin-state/account-health-pushover/state.json.
+      state-file: "" # Defaults to <detected CPA auth dir>/.plugin-state/account-health-pushover/state.ahp. Overrides should stay outside the auth dir or avoid a .json name.
       pushover-http-timeout: 10s
       max-concurrent-checks: 4
 

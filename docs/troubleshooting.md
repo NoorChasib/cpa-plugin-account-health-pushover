@@ -79,10 +79,16 @@ Check `State file health` and the configured/default state path. If persistence 
 Default:
 
 ```text
-<auth-dir>/.plugin-state/account-health-pushover/state.json
+<auth-dir>/.plugin-state/account-health-pushover/state.ahp
 ```
 
 For a custom auth directory with no files at startup, set `state-file` explicitly. Confirm the directory is writable. Do not edit state while CPA is running.
+
+## Auth Files shows `.plugin-state/account-health-pushover/...` entries
+
+Current CPA lists every `*.json` beneath the auth directory, recursively, as an auth file. Plugin versions up to 0.3.0 stored `state.json` there, and because the plugin derived its state directory from the first listed auth file (which sorted to its own state file), every restart nested a new copy one level deeper. Each copy appeared in Auth Files as an "Other" credential with zero traffic.
+
+Upgrade to 0.3.1 or later and restart CPA. On first load the plugin adopts the newest legacy `state.json`, saves it as `state.ahp`, and removes the nested tree; the stale cards disappear after the next auth refresh. If you set `state-file` to a `*.json` path beneath the auth directory, the status page warns and the entry remains until you move it.
 
 ## State file is corrupt
 
