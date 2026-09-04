@@ -41,3 +41,15 @@ plugins:
       max-concurrent-checks: 4
 
       display-timezone: UTC # Status page and Pushover timestamps; e.g. America/Los_Angeles, or "local" for the host zone.
+
+      # Weekly quota alerts (off by default). When enabled the plugin reads each
+      # account's regular weekly window straight from the provider usage endpoint
+      # (Claude oauth/usage, Codex wham/usage, Grok billing credits) and sends one
+      # warning per window when usage crosses quota-warning-percent, plus one
+      # message when the window is exhausted. Health alerts are unaffected.
+      quota-alerts: false
+      quota-poll-interval: 15m
+      quota-warning-percent: 95 # 5% remaining
+      quota-exhausted-percent: 100
+      quota-notification-priority: 0
+      quota-http-timeout: 15s

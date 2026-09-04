@@ -4,7 +4,7 @@ GO ?= go
 GOFMT ?= gofmt
 PLUGIN_ID := account-health-pushover
 MODULE := github.com/NoorChasib/cpa-plugin-account-health-pushover
-VERSION ?= 0.3.2
+VERSION ?= 0.4.0
 LDFLAGS := -X $(MODULE)/internal/plugin.Version=$(VERSION)
 GOOS ?= $(shell $(GO) env GOOS)
 GOARCH ?= $(shell $(GO) env GOARCH)

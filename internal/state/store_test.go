@@ -408,6 +408,18 @@ func TestStateFileSchemaIsAnExactSecretFreeAllowlist(t *testing.T) {
 		CPAStatus:                       "error",
 		CPAUnavailable:                  true,
 		QuotaLimited:                    true,
+		Quota: QuotaState{
+			Percent:            96.5,
+			ResetAt:            now,
+			ObservedAt:         now,
+			LastPollAt:         now,
+			LastError:          "usage endpoint rate limited the poll (HTTP 429)",
+			WindowKey:          "2026-09-01T12:00:00Z",
+			WarningSentAt:      now,
+			ExhaustedSentAt:    now,
+			WarningAttemptAt:   now,
+			ExhaustedAttemptAt: now,
+		},
 	}
 	if err := (Store{Path: path}).Save(data); err != nil {
 		t.Fatal(err)
@@ -435,8 +447,16 @@ func TestStateFileSchemaIsAnExactSecretFreeAllowlist(t *testing.T) {
 		"last_alert_at", "last_alert_attempt_at", "last_alert_attempt_generation",
 		"last_changed_at", "last_observed_at", "last_reason_code", "last_recovery_at",
 		"last_recovery_attempt_at", "last_successful_health_observation", "previous_health",
-		"provider", "quota_limited", "recovery_pending_from", "removed_at", "suspect_class",
+		"provider", "quota", "quota_limited", "recovery_pending_from", "removed_at", "suspect_class",
 		"suspect_reason", "suspect_since", "suspect_target",
+	})
+	var quotaDoc map[string]json.RawMessage
+	if err := json.Unmarshal(accounts["codex:one"]["quota"], &quotaDoc); err != nil {
+		t.Fatal(err)
+	}
+	assertExactJSONKeys(t, quotaDoc, []string{
+		"percent", "reset_at", "observed_at", "last_poll_at", "last_error", "window_key",
+		"warning_sent_at", "exhausted_sent_at", "warning_attempt_at", "exhausted_attempt_at",
 	})
 
 	lower := strings.ToLower(string(raw))

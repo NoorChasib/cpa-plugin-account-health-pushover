@@ -191,6 +191,35 @@ type Account struct {
 	CPAStatus                       string                   `json:"cpa_status,omitempty"`
 	CPAUnavailable                  bool                     `json:"cpa_unavailable"`
 	QuotaLimited                    bool                     `json:"quota_limited"`
+	Quota                           QuotaState               `json:"quota,omitempty"`
+}
+
+// QuotaState is the persisted weekly-quota observation and threshold latches
+// for one account. Latches are keyed by WindowKey (the provider's reset
+// instant) so each weekly window warns at most once and reports exhaustion at
+// most once, across restarts. A new window clears both latches.
+type QuotaState struct {
+	// Percent is the last observed used-percentage of the weekly window.
+	Percent float64 `json:"percent,omitempty"`
+	// ResetAt is the provider-reported end of the current weekly window.
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	// ObservedAt is when Percent/ResetAt were last read successfully.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+	// LastPollAt is the last poll attempt, successful or not.
+	LastPollAt time.Time `json:"last_poll_at,omitempty"`
+	// LastError is a static, sanitized description of the last poll failure;
+	// empty after a successful poll.
+	LastError string `json:"last_error,omitempty"`
+	// WindowKey identifies the weekly window the latches below belong to.
+	WindowKey string `json:"window_key,omitempty"`
+	// WarningSentAt / ExhaustedSentAt are set when Pushover accepted the
+	// corresponding message for WindowKey.
+	WarningSentAt   time.Time `json:"warning_sent_at,omitempty"`
+	ExhaustedSentAt time.Time `json:"exhausted_sent_at,omitempty"`
+	// WarningAttemptAt / ExhaustedAttemptAt suppress re-queueing while a
+	// delivery is in flight or shortly after a failed one.
+	WarningAttemptAt   time.Time `json:"warning_attempt_at,omitempty"`
+	ExhaustedAttemptAt time.Time `json:"exhausted_attempt_at,omitempty"`
 }
 
 // ClearSuspect resets confirmation metadata when an account is not carrying a

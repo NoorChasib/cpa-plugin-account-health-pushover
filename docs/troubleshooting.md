@@ -62,6 +62,22 @@ This is not a credential incident and does not send a failure notification. Expe
 
 Routing resumes according to CPA's own cooldown logic.
 
+## Weekly quota alerts do not arrive
+
+Check, in order:
+
+- `quota-alerts: true` is set and the status page's **Weekly quota alerts** tile is not `disabled`.
+- The status `warnings` list does not say the host lacks `host.auth.get`/`host.http.do`; that means an older or portable CPA build without those callbacks.
+- The account row's **Weekly usage** cell shows a percentage. A dash with an error means the last poll failed; the text is static and closed:
+  - `usage endpoint rejected the credential (HTTP 401/403)`: the stored access token is expired or revoked. CPA refreshes tokens on use; make one request through the account or reauthenticate.
+  - `codex account id could not be resolved`: the Codex auth JSON has no `account_id`/`chatgpt_account_id` and no `id_token` claim. Re-login through CPA.
+  - `usage endpoint rate limited the poll (HTTP 429)`: raise `quota-poll-interval`.
+  - `usage endpoint did not report a weekly window`: the provider changed its response shape. Open an issue with the field names (never values) from a manual call.
+  - `usage request timed out`: raise `quota-http-timeout` or check egress from the CPA container.
+- The threshold was actually crossed since the current window began: latches clear only when the provider reports a new reset instant. `warning_sent_at` / `exhausted_sent_at` in the JSON status show what was already sent for this window.
+
+A warning can lag by up to `quota-poll-interval`; **Check now** queues an immediate poll.
+
 ## Account shows `suspect`
 
 A current condition is ambiguous, such as a request-level 401, timeout, provider 5xx, network failure, non-definitive 403, or an unclassified future cooldown. A first ambiguous failure does not alert. Typed transient evidence uses the 10-minute `transient-confirm-after` threshold; request-level 401 evidence uses the 1-minute `unauthorized-confirm-after` threshold after the delayed recheck gives CPA time to refresh. Request evidence expires after 2 minutes, so a longer unauthorized threshold requires repeated 401s to keep the evidence current.

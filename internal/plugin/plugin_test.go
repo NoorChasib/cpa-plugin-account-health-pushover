@@ -807,7 +807,7 @@ func TestRegistrationUsesCurrentABIContract(t *testing.T) {
 			t.Fatalf("providers field does not document xai: %q", field.Description)
 		}
 	}
-	for _, required := range []string{"providers", "scan-interval", "startup-grace", "transient-confirm-after", "unauthorized-confirm-after", "usage-recheck-delay", "notify-recovery", "reminder-interval", "pushover-app-token-env", "pushover-user-key-env", "management-url"} {
+	for _, required := range []string{"providers", "scan-interval", "startup-grace", "transient-confirm-after", "unauthorized-confirm-after", "usage-recheck-delay", "notify-recovery", "reminder-interval", "pushover-app-token-env", "pushover-user-key-env", "management-url", "quota-alerts", "quota-poll-interval", "quota-warning-percent", "quota-exhausted-percent", "quota-notification-priority", "quota-http-timeout"} {
 		if !fieldNames[required] {
 			t.Fatalf("missing ConfigField %q", required)
 		}
@@ -979,8 +979,11 @@ func TestResourceStatusRedactsAllDiagnosticsAndUsesClosedProviderNames(t *testin
 			LastError:     secret,
 			Configuration: config.CredentialStatus{State: "error", Error: secret},
 		},
+		QuotaAlerts:         true,
+		QuotaWarningPercent: 95,
+		LastQuotaPollError:  secret,
 		Accounts: []monitor.AccountStatus{
-			{Provider: "claude", Label: "person@example.com", AuthIndex: "secret-index", Health: health.Suspect, ReasonCode: secret},
+			{Provider: "claude", Label: "person@example.com", AuthIndex: "secret-index", Health: health.Suspect, ReasonCode: secret, Quota: &monitor.QuotaStatus{Percent: floatPtr(97), LastError: secret, ObservedAt: time.Now()}},
 			{Provider: "ßprovider", Label: "second@example.com", AuthIndex: "other-index", Health: health.Healthy, ReasonCode: secret},
 		},
 	}
@@ -1003,6 +1006,10 @@ func TestResourceStatusRedactsAllDiagnosticsAndUsesClosedProviderNames(t *testin
 	if !strings.Contains(page, "Claude OAuth account 1") || !strings.Contains(page, "OAuth account 1") {
 		t.Fatalf("provider names were not mapped to the closed display set: %s", page)
 	}
+	// Usage percentages are not identifying and stay visible; poll errors do not.
+	if !strings.Contains(page, "97% used") || !strings.Contains(page, "Weekly usage") {
+		t.Fatalf("redacted page dropped the weekly usage column: %s", page)
+	}
 	// The resource shell may carry the same-origin upgrade script, but it
 	// must never prompt for, embed, or forward a management key itself.
 	if strings.Contains(page, "window.prompt") || strings.Contains(page, "X-Management-Key") || strings.Contains(page, "Bearer ") {
@@ -1012,6 +1019,8 @@ func TestResourceStatusRedactsAllDiagnosticsAndUsesClosedProviderNames(t *testin
 		t.Fatalf("resource page missing stale marker or exposing actions: %s", page)
 	}
 }
+
+func floatPtr(value float64) *float64 { return &value }
 
 func TestResourcePageCarriesSameOriginUpgradeScript(t *testing.T) {
 	host := &pluginFakeHost{}

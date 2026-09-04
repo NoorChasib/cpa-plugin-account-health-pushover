@@ -45,6 +45,11 @@ type Status struct {
 	StateFileHealth     string          `json:"state_file_health"`
 	DisplayTimezone     string          `json:"display_timezone"`
 	Warnings            []string        `json:"warnings,omitempty"`
+	QuotaAlerts         bool            `json:"quota_alerts"`
+	QuotaWarningPercent float64         `json:"quota_warning_percent,omitempty"`
+	LastQuotaPoll       time.Time       `json:"last_quota_poll,omitempty"`
+	NextQuotaPoll       time.Time       `json:"next_quota_poll,omitempty"`
+	LastQuotaPollError  string          `json:"last_quota_poll_error,omitempty"`
 	Notifier            notifier.Status `json:"pushover"`
 	Accounts            []AccountStatus `json:"accounts"`
 }
@@ -64,6 +69,7 @@ type AccountStatus struct {
 	LastAlertAt                     time.Time    `json:"last_alert_at,omitempty"`
 	NextReminderAt                  time.Time    `json:"next_reminder_at,omitempty"`
 	RemovedAt                       time.Time    `json:"removed_at,omitempty"`
+	Quota                           *QuotaStatus `json:"quota,omitempty"`
 }
 
 type Monitor struct {
@@ -104,10 +110,23 @@ type Monitor struct {
 	pendingMu sync.Mutex
 	pending   map[string]struct{}
 	evidence  map[string]health.FailureEvidence
+
+	// quotaHost is non-nil when the host supports the callbacks weekly-quota
+	// polling needs. baselined is closed after the startup reconciliation so
+	// the quota loop only annotates accounts that already exist.
+	quotaHost    QuotaHost
+	quotaSignals chan struct{}
+	baselined    chan struct{}
+	baselineOnce sync.Once
 }
 
 func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *notifier.Dispatcher) *Monitor {
 	ctx, cancel := context.WithCancel(context.Background())
+	quotaHost, _ := host.(QuotaHost)
+	warnings := configWarnings(cfg)
+	if cfg.QuotaAlerts && quotaHost == nil {
+		warnings = append(warnings, quotaHostWarning)
+	}
 	return &Monitor{
 		cfg:         cfg,
 		host:        host,
@@ -117,10 +136,12 @@ func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *noti
 		now:         time.Now,
 		data:        state.NewData(),
 		status: Status{
-			PluginEnabled:   cfg.Enabled,
-			StateFileHealth: "not_initialized",
-			DisplayTimezone: cfg.DisplayTimezone,
-			Warnings:        configWarnings(cfg),
+			PluginEnabled:       cfg.Enabled,
+			StateFileHealth:     "not_initialized",
+			DisplayTimezone:     cfg.DisplayTimezone,
+			Warnings:            warnings,
+			QuotaAlerts:         cfg.QuotaAlerts && quotaHost != nil,
+			QuotaWarningPercent: cfg.QuotaWarningPercent,
 		},
 		ctx:            ctx,
 		cancel:         cancel,
@@ -129,6 +150,9 @@ func New(cfg config.Config, host Host, client *notifier.Client, dispatcher *noti
 		signals:        make(chan struct{}, 1),
 		pending:        make(map[string]struct{}),
 		evidence:       make(map[string]health.FailureEvidence),
+		quotaHost:      quotaHost,
+		quotaSignals:   make(chan struct{}, 1),
+		baselined:      make(chan struct{}),
 	}
 }
 
@@ -144,6 +168,10 @@ func (m *Monitor) Start() {
 	}
 	m.loopWG.Add(1)
 	go m.loop()
+	if m.cfg.QuotaAlerts && m.quotaHost != nil {
+		m.loopWG.Add(1)
+		go m.quotaLoop()
+	}
 }
 
 // Stop closes reconciliation admission before waiting, so WaitGroup.Add can
@@ -335,6 +363,7 @@ func (m *Monitor) loop() {
 	m.drainSignalWake()
 	m.clearPending()
 	_ = m.Reconcile(m.ctx, "startup")
+	m.markBaselined()
 
 	ticker := time.NewTicker(m.cfg.ScanInterval)
 	defer ticker.Stop()
@@ -641,7 +670,19 @@ func (m *Monitor) Reconcile(ctx context.Context, trigger string) error {
 
 func (m *Monitor) CheckNow(ctx context.Context) (Status, error) {
 	err := m.Reconcile(ctx, "management")
+	if err == nil {
+		// A management check also refreshes quota, but asynchronously: provider
+		// usage requests must not extend the bounded management response.
+		m.markBaselined()
+		m.RequestQuotaPoll()
+	}
 	return m.Snapshot(), err
+}
+
+// markBaselined releases the quota loop once at least one health
+// reconciliation has populated account rows.
+func (m *Monitor) markBaselined() {
+	m.baselineOnce.Do(func() { close(m.baselined) })
 }
 
 func (m *Monitor) notificationDrainTimeout() time.Duration {
@@ -1367,6 +1408,7 @@ func accountStatuses(data state.Data, reminderInterval time.Duration) []AccountS
 			LastSuccessfulHealthObservation: account.LastSuccessfulHealthObservation,
 			LastAlertAt:                     account.LastAlertAt,
 			RemovedAt:                       account.RemovedAt,
+			Quota:                           quotaStatusOf(account),
 		}
 		if reminderInterval > 0 && account.AlertSent && !account.LastAlertAt.IsZero() && health.IsFailure(account.Health) {
 			row.NextReminderAt = account.LastAlertAt.Add(reminderInterval)

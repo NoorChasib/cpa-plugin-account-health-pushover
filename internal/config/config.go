@@ -29,6 +29,21 @@ const (
 	DisplayDateLayout = "Mon Jan 2 2006"
 	// DisplayClockLayout is the clock half of DisplayTimeLayout.
 	DisplayClockLayout = "3:04:05 PM MST"
+
+	// DefaultQuotaPollInterval is how often provider usage endpoints are read
+	// when quota alerts are enabled.
+	DefaultQuotaPollInterval = 15 * time.Minute
+	// MinQuotaPollInterval keeps the plugin from hammering provider usage
+	// endpoints, which are undocumented and rate limited.
+	MinQuotaPollInterval = time.Minute
+	// DefaultQuotaWarningPercent is the used-percentage that triggers the
+	// "almost out" warning: 95 used means 5 remaining.
+	DefaultQuotaWarningPercent = 95.0
+	// DefaultQuotaExhaustedPercent is the used-percentage that counts as
+	// "ran out".
+	DefaultQuotaExhaustedPercent = 100.0
+	// DefaultQuotaHTTPTimeout bounds one provider usage request.
+	DefaultQuotaHTTPTimeout = 15 * time.Second
 )
 
 var (
@@ -62,6 +77,21 @@ type Config struct {
 	StateFile                  string
 	HTTPTimeout                time.Duration
 	MaxConcurrentChecks        int
+	// QuotaAlerts enables weekly-quota polling and threshold notifications.
+	QuotaAlerts bool
+	// QuotaPollInterval is how often each account's provider usage endpoint is
+	// read while quota alerts are enabled.
+	QuotaPollInterval time.Duration
+	// QuotaWarningPercent is the used-percentage at which one warning is sent
+	// per weekly window (default 95, i.e. 5% remaining).
+	QuotaWarningPercent float64
+	// QuotaExhaustedPercent is the used-percentage that counts as "ran out"
+	// (default 100).
+	QuotaExhaustedPercent float64
+	// QuotaNotificationPriority is the Pushover priority for quota messages.
+	QuotaNotificationPriority int
+	// QuotaHTTPTimeout bounds each provider usage request.
+	QuotaHTTPTimeout time.Duration
 	// DisplayTimezone is the validated IANA zone name, "UTC", or "Local". It is
 	// presentation-only: JSON status stays RFC3339 UTC.
 	DisplayTimezone string
@@ -97,6 +127,12 @@ type rawConfig struct {
 	HTTPTimeout                string   `yaml:"pushover-http-timeout"`
 	MaxConcurrentChecks        *int     `yaml:"max-concurrent-checks"`
 	DisplayTimezone            string   `yaml:"display-timezone"`
+	QuotaAlerts                *bool    `yaml:"quota-alerts"`
+	QuotaPollInterval          string   `yaml:"quota-poll-interval"`
+	QuotaWarningPercent        *float64 `yaml:"quota-warning-percent"`
+	QuotaExhaustedPercent      *float64 `yaml:"quota-exhausted-percent"`
+	QuotaPriority              *int     `yaml:"quota-notification-priority"`
+	QuotaHTTPTimeout           string   `yaml:"quota-http-timeout"`
 }
 
 type Credentials struct {
@@ -131,6 +167,12 @@ func Default() Config {
 		PushoverUserKeyEnv:         DefaultUserKeyEnv,
 		HTTPTimeout:                10 * time.Second,
 		MaxConcurrentChecks:        4,
+		QuotaAlerts:                false,
+		QuotaPollInterval:          DefaultQuotaPollInterval,
+		QuotaWarningPercent:        DefaultQuotaWarningPercent,
+		QuotaExhaustedPercent:      DefaultQuotaExhaustedPercent,
+		QuotaNotificationPriority:  0,
+		QuotaHTTPTimeout:           DefaultQuotaHTTPTimeout,
 		DisplayTimezone:            DefaultDisplayTimezone,
 	}
 }
@@ -208,6 +250,24 @@ func Parse(data []byte) (Config, error) {
 	if raw.MaxConcurrentChecks != nil {
 		cfg.MaxConcurrentChecks = *raw.MaxConcurrentChecks
 	}
+	if raw.QuotaAlerts != nil {
+		cfg.QuotaAlerts = *raw.QuotaAlerts
+	}
+	if cfg.QuotaPollInterval, err = parseDuration(raw.QuotaPollInterval, cfg.QuotaPollInterval, "quota-poll-interval"); err != nil {
+		return Config{}, err
+	}
+	if cfg.QuotaHTTPTimeout, err = parseDuration(raw.QuotaHTTPTimeout, cfg.QuotaHTTPTimeout, "quota-http-timeout"); err != nil {
+		return Config{}, err
+	}
+	if raw.QuotaWarningPercent != nil {
+		cfg.QuotaWarningPercent = *raw.QuotaWarningPercent
+	}
+	if raw.QuotaExhaustedPercent != nil {
+		cfg.QuotaExhaustedPercent = *raw.QuotaExhaustedPercent
+	}
+	if raw.QuotaPriority != nil {
+		cfg.QuotaNotificationPriority = *raw.QuotaPriority
+	}
 	cfg.DisplayTimezone, cfg.DisplayTimezoneWarning = resolveDisplayTimezone(raw.DisplayTimezone)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -256,6 +316,24 @@ func (c *Config) Validate() error {
 	}
 	if c.RecoveryPriority < -2 || c.RecoveryPriority > 1 {
 		return errors.New("recovery-notification-priority must be between -2 and 1")
+	}
+	if c.QuotaNotificationPriority < -2 || c.QuotaNotificationPriority > 1 {
+		return errors.New("quota-notification-priority must be between -2 and 1")
+	}
+	if c.QuotaPollInterval < MinQuotaPollInterval {
+		return fmt.Errorf("quota-poll-interval must be at least %s", MinQuotaPollInterval)
+	}
+	if c.QuotaHTTPTimeout <= 0 || c.QuotaHTTPTimeout > time.Minute {
+		return errors.New("quota-http-timeout must be between 1s and 1m")
+	}
+	if c.QuotaWarningPercent <= 0 || c.QuotaWarningPercent > 100 {
+		return errors.New("quota-warning-percent must be between 1 and 100")
+	}
+	if c.QuotaExhaustedPercent <= 0 || c.QuotaExhaustedPercent > 100 {
+		return errors.New("quota-exhausted-percent must be between 1 and 100")
+	}
+	if c.QuotaWarningPercent >= c.QuotaExhaustedPercent {
+		return errors.New("quota-warning-percent must be lower than quota-exhausted-percent")
 	}
 	if !envNamePattern.MatchString(c.PushoverAppTokenEnv) || !envNamePattern.MatchString(c.PushoverUserKeyEnv) {
 		return errors.New("Pushover environment variable names are invalid")

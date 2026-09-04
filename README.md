@@ -2,7 +2,9 @@
 
 `account-health-pushover` is a native CLIProxyAPI (CPA) Go plugin that monitors Claude, Codex, and Grok (xAI) OAuth credentials and sends transition-based Pushover notifications when an account requires reauthentication or remains credential-unhealthy.
 
-It deliberately does **not** alert for ordinary quota consumption. Five-hour limits, weekly limits, Claude model/Fable limits, HTTP 429 responses, and known quota cooldowns are credential-healthy operational states.
+Health alerts deliberately do **not** fire for ordinary quota consumption. Five-hour limits, weekly limits, Claude model/Fable limits, HTTP 429 responses, and known quota cooldowns are credential-healthy operational states.
+
+Optionally (`quota-alerts: true`), the plugin also polls each account's regular **weekly** usage window straight from the provider and sends one warning when 5% remains and one message when the window is exhausted. See [Weekly quota alerts](#weekly-quota-alerts).
 
 ## What it does
 
@@ -19,6 +21,7 @@ It deliberately does **not** alert for ordinary quota consumption. Five-hour lim
 - Decodes only `AuthIndex`, `Failed`, and `Failure.StatusCode` from failed usage records, retains that structured status evidence briefly, and schedules a delayed runtime recheck; it never materializes the failure body or sends from the request callback.
 - Provides authenticated JSON status, an authenticated browser status page with **Check now** and **Test notification** buttons, and a redacted read-only browser resource that appears in the Management Center sidebar.
 - Renders timestamps in a configurable `display-timezone` as `Tue Sep 1 2026 - 6:25:36 PM PDT` on the status page and in Pushover messages.
+- Optionally polls Claude, Codex, and Grok weekly usage every 15 minutes and sends one "almost used" warning plus one "limit reached" message per weekly window, latched across restarts.
 - Never changes credential priority, routing policy, quota state, OAuth tokens, or auth files.
 
 This repository has no code-level dependency on the separate reset-priority plugin.
@@ -32,7 +35,7 @@ The plugin uses:
 - native ABI version `1`;
 - JSON schema version `4`;
 - exported entrypoint symbol `cliproxy_plugin_init`;
-- host callbacks `host.auth.list`, `host.auth.get_runtime`, and `host.log`;
+- host callbacks `host.auth.list`, `host.auth.get_runtime`, and `host.log`, plus `host.auth.get` and `host.http.do` only while `quota-alerts` is enabled;
 - capabilities `usage_plugin` and `management_api`;
 - build mode `CGO_ENABLED=1 go build -buildmode=c-shared`.
 
@@ -103,6 +106,12 @@ plugins:
       pushover-http-timeout: 10s
       max-concurrent-checks: 4
       display-timezone: UTC # e.g. America/Los_Angeles, or "local" for the host zone
+      quota-alerts: false # true enables weekly usage polling and the 5%-remaining / exhausted messages
+      quota-poll-interval: 15m
+      quota-warning-percent: 95
+      quota-exhausted-percent: 100
+      quota-notification-priority: 0
+      quota-http-timeout: 15s
 ```
 
 `priority: 20` is CPA's plugin load/order priority. The plugin never reads it as an OAuth priority and never mutates credential priority.
@@ -115,7 +124,7 @@ Full deployment instructions: [docs/install-docker-compose.md](docs/install-dock
 2. Restart/reload CPA after changing configuration.
 3. Open Management Center → Plugin Store and refresh.
 4. Install **Account Health Pushover** (`account-health-pushover`).
-5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.3.2.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
+5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.4.0.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
 6. Add the two Coolify secret variables and enable the plugin config.
 7. Restart/reload CPA.
 8. Open **Account Health Pushover** from the Management Center sidebar. When the console is served from the CPA origin with the management key remembered, the page upgrades itself to the authenticated view with **Test notification** and **Check now** buttons; otherwise use the authenticated Management API.
@@ -134,7 +143,7 @@ Download the matching release archive plus `checksums.txt`, then verify and inst
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
-unzip account-health-pushover_0.3.2_linux_amd64.zip
+unzip account-health-pushover_0.4.0_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
 docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
@@ -222,6 +231,35 @@ Do not paste the management key into shell history on shared systems; use an env
 | `pushover-http-timeout` | `10s` | Timeout per Pushover HTTP attempt. |
 | `max-concurrent-checks` | `4` | Bounded concurrent `host.auth.get_runtime` calls. |
 | `display-timezone` | `UTC` | IANA zone (for example `America/Los_Angeles`) or `local` used to render timestamps on the HTML status view and in Pushover message bodies as `Tue Sep 1 2026 - 6:25:36 PM PDT`. Unknown names fall back to UTC with a status warning. The JSON status route always stays RFC3339 UTC. |
+| `quota-alerts` | `false` | Poll each account's regular weekly usage window and send the threshold messages described in [Weekly quota alerts](#weekly-quota-alerts). |
+| `quota-poll-interval` | `15m` | How often each account's provider usage endpoint is read; minimum `1m`. |
+| `quota-warning-percent` | `95` | Used-percentage that sends the single per-window warning (`95` means 5% remaining). Must be below `quota-exhausted-percent`. |
+| `quota-exhausted-percent` | `100` | Used-percentage that sends the single per-window "limit reached" message. |
+| `quota-notification-priority` | `0` | Pushover priority for quota messages, `-2` through `1`. |
+| `quota-http-timeout` | `15s` | Timeout per provider usage request, at most `1m`. |
+
+## Weekly quota alerts
+
+With `quota-alerts: true` the plugin reads the regular weekly window for every monitored OAuth account on `quota-poll-interval`, using the same endpoints the providers' own CLIs use:
+
+| Provider | Endpoint | Fields read |
+|---|---|---|
+| Claude | `GET https://api.anthropic.com/api/oauth/usage` | `seven_day.utilization`, `seven_day.resets_at` |
+| Codex | `GET https://chatgpt.com/backend-api/wham/usage` | the window whose `limit_window_seconds` is exactly `604800`: `used_percent`, `reset_at` / `reset_after_seconds` |
+| Grok | `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` | `config.creditUsagePercent` (the shared weekly pool), `config.currentPeriod.end` |
+
+Five-hour windows, Claude model-scoped weekly windows, Codex additional/code-review limits, and credits are ignored.
+
+Per account and per weekly window (keyed by the provider's reset instant) the plugin sends at most:
+
+- one **"weekly limit almost used"** message when usage first reaches `quota-warning-percent`;
+- one **"weekly limit reached"** message when usage first reaches `quota-exhausted-percent`.
+
+Both latches persist in the state file, so restarts and repeated polls never repeat a message, and both clear when the provider reports a new window. Messages include the used percentage, the remaining percentage, and the reset time in `display-timezone`. Quota messages never change health state, incident generations, reminders, or recovery notifications.
+
+Detection is polling-based: an account that crosses a threshold is reported at the next poll, so a warning can lag by up to `quota-poll-interval`. **Check now** also queues an immediate quota poll.
+
+Reading usage requires the account's own OAuth access token, so while quota alerts are enabled the plugin calls `host.auth.get` and `host.http.do`. It decodes only `access_token`, `account_id`/`chatgpt_account_id` (Codex), the `id_token` account claim (Codex fallback), and `sub` (Grok) from the credential JSON; the document is never logged, persisted, or rendered, and provider response bodies are discarded after parsing. Every quota error shown in status is a closed, static string. The endpoints are undocumented and the providers change limits without notice; a change breaks the alert, never the health monitor.
 
 Environment values take precedence over secret files. Direct Pushover values are intentionally not supported as plugin config fields.
 
@@ -264,7 +302,7 @@ make vet
 make test-race
 make build
 make c-shared
-make package-current VERSION=0.3.2
+make package-current VERSION=0.4.0
 make checksums
 make verify-release
 ```
@@ -283,14 +321,14 @@ The smoke build enables a compile-time-only local/mock endpoint seam. Release bu
 
 ## Release assets
 
-A `v0.3.2` tag produces:
+A `v0.4.0` tag produces:
 
 ```text
-account-health-pushover_0.3.2_linux_amd64.zip
-account-health-pushover_0.3.2_linux_arm64.zip
-account-health-pushover_0.3.2_darwin_amd64.zip
-account-health-pushover_0.3.2_darwin_arm64.zip
-account-health-pushover_0.3.2_windows_amd64.zip
+account-health-pushover_0.4.0_linux_amd64.zip
+account-health-pushover_0.4.0_linux_arm64.zip
+account-health-pushover_0.4.0_darwin_amd64.zip
+account-health-pushover_0.4.0_darwin_arm64.zip
+account-health-pushover_0.4.0_windows_amd64.zip
 checksums.txt
 ```
 
@@ -307,7 +345,9 @@ Release procedure: [docs/release.md](docs/release.md).
 [ ] Claude accounts discovered dynamically
 [ ] Codex accounts discovered dynamically
 [ ] Grok (xai) accounts discovered dynamically
-[ ] quota-limited accounts do not alert
+[ ] quota-limited accounts do not send health alerts
+[ ] with quota-alerts enabled, each account row shows weekly usage and a reset time
+[ ] an account at or above quota-warning-percent sends exactly one warning per week
 [ ] reauth-required account sends exactly one alert
 [ ] unchanged incident does not spam
 [ ] successful reauth sends exactly one recovery alert
@@ -320,7 +360,8 @@ Release procedure: [docs/release.md](docs/release.md).
 
 ## Security notes
 
-- `host.auth.get` is deliberately not called because current CPA returns full raw auth JSON through that callback.
+- `host.auth.get` returns full raw auth JSON, so it is called only while `quota-alerts` is enabled, only for OAuth accounts of supported providers, and the document is decoded for the token fields of one usage request and then dropped.
+- Provider usage responses are parsed for the weekly percentage and reset instant only; bodies and provider error text never reach logs, state, status, or notifications.
 - The potentially secret `HostAuthFileEntry.Account` field is deliberately ignored.
 - Usage failure bodies are never persisted, logged, rendered, or copied into notifications.
 - Pushover response bodies and network error details are never exposed in status.

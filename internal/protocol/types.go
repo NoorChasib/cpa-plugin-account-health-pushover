@@ -20,7 +20,9 @@ const (
 
 	MethodHostLog            = "host.log"
 	MethodHostAuthList       = "host.auth.list"
+	MethodHostAuthGet        = "host.auth.get"
 	MethodHostAuthGetRuntime = "host.auth.get_runtime"
+	MethodHostHTTPDo         = "host.http.do"
 )
 
 type Envelope struct {
@@ -149,6 +151,33 @@ type HostAuthGetRequest struct {
 
 type HostAuthGetRuntimeResponse struct {
 	Auth HostAuthFileEntry `json:"auth"`
+}
+
+// HostAuthGetResponse is the host.auth.get result. JSON is the complete
+// physical credential document and therefore contains OAuth tokens; callers
+// must decode only the fields they need and never log, persist, or render it.
+type HostAuthGetResponse struct {
+	AuthIndex string          `json:"auth_index"`
+	Name      string          `json:"name,omitempty"`
+	Path      string          `json:"path,omitempty"`
+	JSON      json.RawMessage `json:"json"`
+}
+
+// HostHTTPRequest is the host.http.do request (snake_case keys; Body is
+// base64-encoded by encoding/json).
+type HostHTTPRequest struct {
+	Method  string              `json:"method,omitempty"`
+	URL     string              `json:"url,omitempty"`
+	Headers map[string][]string `json:"headers,omitempty"`
+	Body    []byte              `json:"body,omitempty"`
+}
+
+// HostHTTPResponse is the host.http.do result. Upstream returns the untagged
+// pluginapi.HTTPResponse, so the wire keys are capitalized.
+type HostHTTPResponse struct {
+	StatusCode int                 `json:"StatusCode"`
+	Headers    map[string][]string `json:"Headers"`
+	Body       []byte              `json:"Body"`
 }
 
 type HostLogRequest struct {

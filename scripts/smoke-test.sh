@@ -96,6 +96,8 @@ plugins:
       startup-grace: 100ms
       transient-confirm-after: 1s
       notification-coalesce-window: 0
+      quota-alerts: true
+      quota-poll-interval: 1m
       pushover-app-token-env: CPA_PUSHOVER_APP_TOKEN
       pushover-user-key-env: CPA_PUSHOVER_USER_KEY
 YAML
@@ -147,6 +149,18 @@ curl -fsS -H "X-Management-Key: smoke-management-key" \
   "http://127.0.0.1:$HOST_PORT/v0/management/plugins/account-health-pushover/status" \
   >"$TMP_DIR/status.json"
 grep -q '"state_file_health"' "$TMP_DIR/status.json"
+# The real host exposes host.auth.get/host.http.do, so quota alerts must
+# report enabled with no host-capability warning.
+if ! grep -Eq '"quota_alerts": ?true' "$TMP_DIR/status.json"; then
+  echo "status did not report quota_alerts=true:" >&2
+  cat "$TMP_DIR/status.json" >&2
+  docker logs --tail=50 "$CONTAINER" >&2 || true
+  exit 1
+fi
+if grep -q 'does not expose host.auth.get' "$TMP_DIR/status.json"; then
+  echo "quota alerts were disabled by a host capability warning" >&2
+  exit 1
+fi
 
 curl -fsS -X POST -H "X-Management-Key: smoke-management-key" \
   "http://127.0.0.1:$HOST_PORT/v0/management/plugins/account-health-pushover/check" \

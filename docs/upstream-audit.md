@@ -59,11 +59,17 @@ Exact callback names:
 host.auth.list
 host.auth.get_runtime
 host.log
+host.auth.get      (only while quota-alerts is enabled)
+host.http.do       (only while quota-alerts is enabled)
 ```
 
 `host.auth.list` request is `{}` and returns `{"files":[...]}`.
 
 `host.auth.get_runtime` request is `{"auth_index":"..."}` and returns `{"auth":{...}}`.
+
+`host.auth.get` request is `{"auth_index":"..."}` and returns `{"auth_index","name","path","json"}` where `json` is the complete physical credential document read from disk (`internal/pluginhost/auth_callbacks.go` `authPhysicalJSONByIndex`).
+
+`host.http.do` request is `{"method","url","headers","body"}` (snake_case; `body` base64) and returns the untagged `pluginapi.HTTPResponse` (`StatusCode`, `Headers`, `Body` base64). The host issues the request through its proxy-aware client with no timeout of its own, and the native callback cannot be cancelled once entered; the plugin bounds its wait with `quota-http-timeout` and lets a stuck callback drain at shutdown.
 
 ### Synchronous callback cancellation limitation
 
@@ -138,7 +144,19 @@ Therefore v0.1 classifies callback-visible health conservatively from current `s
 
 `NextRetryAfter` is deliberately not treated as quota evidence by itself. At the audited commit CPA uses that field for quota, 401, 403, 404, and transient 5xx cooldowns, so doing so would hide real credential or upstream failures. Recent structured evidence expires after a short TTL and is cleared by a newer or active/available runtime observation.
 
-The plugin does not call `host.auth.get` to fill the gap. That callback returns raw auth-file JSON containing OAuth/access/refresh tokens and is unnecessary for current safe identity because list/runtime entries already expose `email`, `label`, `name`, and `auth_index`.
+The plugin does not call `host.auth.get` to fill the health-classification gap. That callback returns raw auth-file JSON containing OAuth/access/refresh tokens and is unnecessary for current safe identity because list/runtime entries already expose `email`, `label`, `name`, and `auth_index`. It is called only for weekly quota polling (below), where the access token is unavoidable.
+
+## Weekly quota endpoints
+
+Quota alerts do not use CPA's quota observation: at the audited commit `host.auth.get_runtime` omits `Quota.Signals`, and the `usage.handle` record's `ResponseHeaders` carry rate-limit headers for Claude and Codex only (`sdk/cliproxy/auth/quota_signals.go` `ProviderSupportsQuotaObservation`); xAI responses carry none. The plugin therefore reads each provider's own usage endpoint with the account's access token, verified against live accounts on 2026-09-04:
+
+| Provider | Request | Response fields used |
+|---|---|---|
+| Claude | `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` | `seven_day.utilization` (0–100), `seven_day.resets_at` (RFC3339) |
+| Codex | `GET https://chatgpt.com/backend-api/wham/usage` with `Chatgpt-Account-Id` and a CLI-shaped `User-Agent` | window with `limit_window_seconds == 604800`: `used_percent`, `reset_at` (unix seconds) or `reset_after_seconds` |
+| Grok | `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` with `X-XAI-Token-Auth: xai-grok-cli` and optional `x-userid` | `config.creditUsagePercent` (0–100), `config.currentPeriod.end` (RFC3339); `config.isUnifiedBillingUser` was `true` on the verified account, so this is the shared weekly pool |
+
+The Grok request shape mirrors `crates/codegen/xai-grok-shell/src/extensions/billing.rs` in `xai-org/grok-build` (commit `72a6125`); the endpoint accepted a bearer-only request in verification, so the extra headers are sent for parity, not necessity. The Codex `x-userid` equivalent is the ChatGPT account ID that CPA persists as `account_id`; CPA persists the xAI OpenID subject as `sub`. All three endpoints are undocumented.
 
 `HostAuthFileEntry.Account` can contain a raw API key for API-key credentials. The plugin ignores this field and filters to OAuth credentials.
 

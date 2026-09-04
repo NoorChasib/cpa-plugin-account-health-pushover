@@ -18,7 +18,7 @@ make vet
 make test-race
 make build
 make c-shared
-make package-current VERSION=0.3.2
+make package-current VERSION=0.4.0
 make checksums
 make verify-release
 make smoke
@@ -42,14 +42,14 @@ Release builds do not set the test seam and always use Pushover HTTPS.
 
 ## Tag and publish
 
-1. Update version references if releasing beyond `0.3.2`. v0.1 release automation accepts stable `vX.Y.Z` tags only; prerelease suffixes are intentionally rejected.
+1. Update version references if releasing beyond `0.4.0`. v0.1 release automation accepts stable `vX.Y.Z` tags only; prerelease suffixes are intentionally rejected.
 2. Confirm `git status` is clean and CI passes.
-3. **Mandatory rehearsal:** run the Release workflow manually on the release commit (GitHub → Actions → Release → Run workflow). The optional `version` input (default `0.3.2`, stable `X.Y.Z` only) is used solely to name the rehearsal artifacts. The rehearsal must complete all five platform build legs **and** the `verify-bundle` job, which downloads every artifact and runs the full-mode `verify-release.sh` against the assembled five-platform bundle. Rehearsals never publish: the `publish` job runs only for tag pushes. Do not tag until the rehearsal is green — the four cross-platform legs (including the Windows UCRT64 leg) execute nowhere else before tag time.
+3. **Mandatory rehearsal:** run the Release workflow manually on the release commit (GitHub → Actions → Release → Run workflow). The optional `version` input (default `0.4.0`, stable `X.Y.Z` only) is used solely to name the rehearsal artifacts. The rehearsal must complete all five platform build legs **and** the `verify-bundle` job, which downloads every artifact and runs the full-mode `verify-release.sh` against the assembled five-platform bundle. Rehearsals never publish: the `publish` job runs only for tag pushes. Do not tag until the rehearsal is green — the four cross-platform legs (including the Windows UCRT64 leg) execute nowhere else before tag time.
 4. Create and push an annotated tag:
 
    ```bash
-   git tag -a v0.3.2 -m "Release v0.3.2"
-   git push origin v0.3.2
+   git tag -a v0.4.0 -m "Release v0.4.0"
+   git push origin v0.4.0
    ```
 
 5. The tag-triggered workflow runs format, vet, race tests, normal build, the enforced Docker smoke test, and a native c-shared matrix. If GitHub does not start a run for the tag push (check `gh run list --workflow=release.yml`), dispatch the same workflow against the tag ref; it builds from the tag and the `publish` job runs exactly as for a tag push:
@@ -62,11 +62,11 @@ Release builds do not set the test seam and always use Pushover HTTPS.
 6. The workflow publishes:
 
    ```text
-   account-health-pushover_0.3.2_linux_amd64.zip
-   account-health-pushover_0.3.2_linux_arm64.zip
-   account-health-pushover_0.3.2_darwin_amd64.zip
-   account-health-pushover_0.3.2_darwin_arm64.zip
-   account-health-pushover_0.3.2_windows_amd64.zip
+   account-health-pushover_0.4.0_linux_amd64.zip
+   account-health-pushover_0.4.0_linux_arm64.zip
+   account-health-pushover_0.4.0_darwin_amd64.zip
+   account-health-pushover_0.4.0_darwin_arm64.zip
+   account-health-pushover_0.4.0_windows_amd64.zip
    checksums.txt
    ```
 
@@ -85,7 +85,7 @@ sha256sum -c checksums.txt          # macOS: shasum -a 256 -c checksums.txt
 Inspect one ZIP per platform:
 
 ```bash
-unzip -l account-health-pushover_0.3.2_linux_amd64.zip
+unzip -l account-health-pushover_0.4.0_linux_amd64.zip
 ```
 
 Expected only:

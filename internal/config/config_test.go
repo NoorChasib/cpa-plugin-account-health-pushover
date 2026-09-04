@@ -28,6 +28,38 @@ func TestParseDefaults(t *testing.T) {
 	if cfg.DisplayTimezone != "UTC" || cfg.DisplayTimezoneWarning != "" {
 		t.Fatalf("display timezone default = %q warning=%q", cfg.DisplayTimezone, cfg.DisplayTimezoneWarning)
 	}
+	if cfg.QuotaAlerts || cfg.QuotaPollInterval != 15*time.Minute || cfg.QuotaWarningPercent != 95 || cfg.QuotaExhaustedPercent != 100 || cfg.QuotaNotificationPriority != 0 || cfg.QuotaHTTPTimeout != 15*time.Second {
+		t.Fatalf("unexpected quota defaults: %+v", cfg)
+	}
+}
+
+func TestParseQuotaAlerts(t *testing.T) {
+	cfg, err := Parse([]byte("quota-alerts: true\nquota-poll-interval: 5m\nquota-warning-percent: 90\nquota-exhausted-percent: 99.5\nquota-notification-priority: 1\nquota-http-timeout: 20s\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.QuotaAlerts || cfg.QuotaPollInterval != 5*time.Minute || cfg.QuotaWarningPercent != 90 || cfg.QuotaExhaustedPercent != 99.5 || cfg.QuotaNotificationPriority != 1 || cfg.QuotaHTTPTimeout != 20*time.Second {
+		t.Fatalf("quota config not parsed: %+v", cfg)
+	}
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{"poll too frequent", "quota-poll-interval: 30s"},
+		{"warning above exhausted", "quota-warning-percent: 100"},
+		{"warning equals exhausted", "quota-warning-percent: 80\nquota-exhausted-percent: 80"},
+		{"zero warning", "quota-warning-percent: 0"},
+		{"exhausted above 100", "quota-exhausted-percent: 101"},
+		{"emergency quota priority", "quota-notification-priority: 2"},
+		{"zero quota timeout", "quota-http-timeout: 0s"},
+		{"huge quota timeout", "quota-http-timeout: 5m"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := Parse([]byte(test.raw)); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
 }
 
 func TestDisplayTimezone(t *testing.T) {

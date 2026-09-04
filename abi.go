@@ -235,6 +235,39 @@ func (hostBridge) GetRuntime(ctx context.Context, authIndex string) (protocol.Ho
 	return response.Auth, nil
 }
 
+// GetAuth returns the raw physical credential JSON for one auth index. The
+// document contains OAuth tokens: callers decode only the fields required for
+// a provider usage request and never log, persist, or render it.
+func (hostBridge) GetAuth(ctx context.Context, authIndex string) ([]byte, error) {
+	result, err := callHost(ctx, protocol.MethodHostAuthGet, protocol.HostAuthGetRequest{AuthIndex: authIndex})
+	if err != nil {
+		return nil, err
+	}
+	var response protocol.HostAuthGetResponse
+	if err := json.Unmarshal(result, &response); err != nil {
+		return nil, errors.New("decode host.auth.get response")
+	}
+	if len(response.JSON) == 0 {
+		return nil, errors.New("host.auth.get returned an empty document")
+	}
+	return []byte(response.JSON), nil
+}
+
+// HTTPDo performs one upstream HTTP request through CPA's proxy-aware client.
+// The native callback is synchronous and cannot be cancelled once entered;
+// the monitor bounds its own wait and lets a stuck call drain at shutdown.
+func (hostBridge) HTTPDo(ctx context.Context, request protocol.HostHTTPRequest) (protocol.HostHTTPResponse, error) {
+	result, err := callHost(ctx, protocol.MethodHostHTTPDo, request)
+	if err != nil {
+		return protocol.HostHTTPResponse{}, err
+	}
+	var response protocol.HostHTTPResponse
+	if err := json.Unmarshal(result, &response); err != nil {
+		return protocol.HostHTTPResponse{}, errors.New("decode host.http.do response")
+	}
+	return response, nil
+}
+
 func (hostBridge) Log(ctx context.Context, level, message string, fields map[string]any) {
 	_, _ = callHost(ctx, protocol.MethodHostLog, protocol.HostLogRequest{
 		Level:   level,

@@ -46,6 +46,13 @@ type statusPageData struct {
 	HealthyCount        int
 	QuotaCount          int
 	AttentionCount      int
+	QuotaAlerts         bool
+	QuotaWarningPercent string
+	LastQuotaPoll       pageTime
+	NextQuotaPoll       pageTime
+	LastQuotaPollError  string
+	QuotaNearLimitCount int
+	QuotaExhaustedCount int
 	Providers           []pageProvider
 }
 
@@ -79,6 +86,20 @@ type pageAccount struct {
 	LastAlert      pageTime
 	NextReminder   pageTime
 	RemovedAt      pageTime
+	Quota          pageQuota
+}
+
+// pageQuota is the per-account weekly usage cell. Set is false until the
+// first successful poll; Class colors the usage pill by threshold.
+type pageQuota struct {
+	Set        bool
+	Percent    string
+	Class      string
+	ResetAt    pageTime
+	ObservedAt pageTime
+	LastError  string
+	Warned     bool
+	Exhausted  bool
 }
 
 // pageTime carries one instant in the forms the template needs. A zero value
@@ -173,6 +194,12 @@ time{font-variant-numeric:tabular-nums}
 time .d,time .t{white-space:nowrap}
 .rel{display:block;font-size:12px;color:var(--muted)}
 .dash{color:var(--faint)}
+.usage{display:flex;flex-direction:column;gap:4px;min-width:120px}
+.usage .bar{height:6px;border-radius:999px;background:var(--neutral-bg);border:1px solid var(--neutral-bd);overflow:hidden}
+.usage .bar span{display:block;height:100%;background:var(--ok-fg)}
+.usage .bar.warn span{background:var(--warn-fg)}
+.usage .bar.err span{background:var(--err-fg)}
+.usage .pct{font-weight:550;font-variant-numeric:tabular-nums}
 .error-text{color:var(--err-fg)}
 .empty{padding:18px 14px;color:var(--muted);font-style:italic}
 .footnote{margin-top:28px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.55}
@@ -210,6 +237,13 @@ time .d,time .t{white-space:nowrap}
     <div class="hint">{{.HealthyCount}} healthy · {{.QuotaCount}} quota limited · {{.AttentionCount}} need attention</div>
   </div>
   <div class="stat">
+    <div class="label">Weekly quota alerts</div>
+    {{if .QuotaAlerts}}<div class="value">{{.QuotaExhaustedCount}} exhausted · {{.QuotaNearLimitCount}} near limit</div>
+    <div class="hint">Warn at {{.QuotaWarningPercent}} used · next poll {{if .NextQuotaPoll.Set}}{{.NextQuotaPoll.Relative}}{{else}}—{{end}}</div>
+    {{else}}<div class="value"><span class="pill">disabled</span></div>
+    <div class="hint">Set quota-alerts: true to poll weekly usage</div>{{end}}
+  </div>
+  <div class="stat">
     <div class="label">Next health scan</div>
     <div class="value">{{template "when" .NextScan}}</div>
   </div>
@@ -235,6 +269,7 @@ time .d,time .t{white-space:nowrap}
 </div>
 
 {{if .LastMonitoringError}}<div class="alert warn"><strong>Monitoring:</strong> {{.LastMonitoringError}}</div>{{end}}
+{{if .LastQuotaPollError}}<div class="alert warn"><strong>Weekly quota poll:</strong> {{.LastQuotaPollError}}</div>{{end}}
 {{if .Pushover.Error}}<div class="alert"><strong>Pushover configuration:</strong> {{.Pushover.Error}}</div>{{end}}
 {{if .Pushover.LastError}}<div class="alert"><strong>Last Pushover error:</strong> {{.Pushover.LastError}}</div>{{end}}
 {{if .Warnings}}<div class="alert warn"><strong>Warnings</strong><ul>{{range .Warnings}}<li>{{.}}</li>{{end}}</ul></div>{{end}}
@@ -254,6 +289,7 @@ time .d,time .t{white-space:nowrap}
         <th>Account</th>
         <th>Health</th>
         <th>CPA status</th>
+        {{if $.QuotaAlerts}}<th>Weekly usage</th>{{end}}
         <th>First detected</th>
         <th>Last transition</th>
         <th>Last healthy</th>
@@ -267,6 +303,7 @@ time .d,time .t{white-space:nowrap}
         <td class="account"><span class="name">{{.Label}}</span>{{if $.Authenticated}}<span class="sub"><code>{{.AuthIndex}}</code></span>{{end}}</td>
         <td><span class="pill {{.HealthClass}}">{{.Health}}</span>{{if .ReasonCode}}<span class="sub">{{.ReasonCode}}</span>{{end}}</td>
         <td>{{if .CPAStatus}}{{.CPAStatus}}{{else}}<span class="dash">—</span>{{end}}{{if or .Unavailable .QuotaLimited}}<span class="sub flags">{{if .Unavailable}}<span class="pill warn">unavailable</span>{{end}}{{if .QuotaLimited}}<span class="pill info">quota limited</span>{{end}}</span>{{end}}</td>
+        {{if $.QuotaAlerts}}<td>{{template "usage" .Quota}}</td>{{end}}
         <td>{{template "when" .FirstDetected}}</td>
         <td>{{template "when" .LastTransition}}</td>
         <td>{{template "when" .LastHealthy}}</td>
@@ -288,6 +325,7 @@ time .d,time .t{white-space:nowrap}
 <script>` + browserAuthScript + `{{if .Authenticated}}` + managementActionsScript + `{{else}}` + resourceBootstrapScript + `{{end}}</script>
 </body>
 </html>
+{{define "usage"}}{{if .Set}}<div class="usage"><span class="pct">{{.Percent}} used</span><div class="bar {{.Class}}"><span style="width:{{.Percent}}"></span></div>{{if .ResetAt.Set}}<span class="sub">resets {{.ResetAt.Relative}}</span>{{end}}{{if or .Warned .Exhausted}}<span class="sub flags">{{if .Exhausted}}<span class="pill err">exhausted alert sent</span>{{else}}<span class="pill warn">warning sent</span>{{end}}</span>{{end}}{{if .LastError}}<span class="sub error-text">{{.LastError}}</span>{{end}}</div>{{else if .LastError}}<span class="dash">—</span><span class="sub error-text">{{.LastError}}</span>{{else}}<span class="dash">—</span>{{end}}{{end}}
 {{define "when"}}{{if .Set}}<time datetime="{{.Exact}}" title="{{.Exact}}"><span class="d">{{.Date}}</span> - <span class="t">{{.Clock}}</span></time>{{if .Relative}}<span class="rel">{{.Relative}}</span>{{end}}{{else}}<span class="dash">—</span>{{end}}{{end}}
 `))
 
@@ -317,6 +355,11 @@ func buildStatusPageData(status monitor.Status, authenticated bool, now time.Tim
 		NextScan:            when(status.NextScan),
 		LastScan:            when(status.LastScan),
 		LastSuccessfulScan:  when(status.LastSuccessfulScan),
+		QuotaAlerts:         status.QuotaAlerts,
+		QuotaWarningPercent: formatPagePercent(status.QuotaWarningPercent),
+		LastQuotaPoll:       when(status.LastQuotaPoll),
+		NextQuotaPoll:       when(status.NextQuotaPoll),
+		LastQuotaPollError:  status.LastQuotaPollError,
 		StateFileHealth:     status.StateFileHealth,
 		StateFileClass:      stateFileClass(status.StateFileHealth),
 		StateFile:           status.StateFile,
@@ -362,7 +405,16 @@ func buildStatusPageData(status monitor.Status, authenticated bool, now time.Tim
 			LastAlert:      when(account.LastAlertAt),
 			NextReminder:   when(account.NextReminderAt),
 			RemovedAt:      when(account.RemovedAt),
+			Quota:          buildPageQuota(account.Quota, status.QuotaWarningPercent, when),
 		})
+		if account.Quota != nil && account.Quota.Percent != nil {
+			switch {
+			case *account.Quota.Percent >= 100:
+				data.QuotaExhaustedCount++
+			case status.QuotaWarningPercent > 0 && *account.Quota.Percent >= status.QuotaWarningPercent:
+				data.QuotaNearLimitCount++
+			}
+		}
 		data.AccountCount++
 		switch {
 		case account.Health == health.Healthy:
@@ -374,6 +426,38 @@ func buildStatusPageData(status monitor.Status, authenticated bool, now time.Tim
 		}
 	}
 	return data
+}
+
+func buildPageQuota(q *monitor.QuotaStatus, warnAt float64, when func(time.Time) pageTime) pageQuota {
+	if q == nil {
+		return pageQuota{}
+	}
+	out := pageQuota{
+		LastError:  q.LastError,
+		ResetAt:    when(q.ResetAt),
+		ObservedAt: when(q.ObservedAt),
+		Warned:     !q.WarningSentAt.IsZero(),
+		Exhausted:  !q.ExhaustedSentAt.IsZero(),
+	}
+	if q.Percent == nil {
+		return out
+	}
+	out.Set = true
+	out.Percent = formatPagePercent(*q.Percent)
+	switch {
+	case *q.Percent >= 100:
+		out.Class = "err"
+	case warnAt > 0 && *q.Percent >= warnAt:
+		out.Class = "warn"
+	}
+	return out
+}
+
+func formatPagePercent(value float64) string {
+	if value == float64(int64(value)) {
+		return fmt.Sprintf("%d%%", int64(value))
+	}
+	return fmt.Sprintf("%.1f%%", value)
 }
 
 func newPageTime(t, now time.Time, loc *time.Location) pageTime {
@@ -484,8 +568,14 @@ func redactResourceStatus(status monitor.Status) monitor.Status {
 		}
 		status.Accounts[i].AuthIndex = "hidden"
 		status.Accounts[i].ReasonCode = ""
+		if quota := status.Accounts[i].Quota; quota != nil {
+			redactedQuota := *quota
+			redactedQuota.LastError = ""
+			status.Accounts[i].Quota = &redactedQuota
+		}
 	}
 	status.StateFile = ""
+	status.LastQuotaPollError = ""
 	status.LastMonitoringError = ""
 	status.Warnings = nil
 	status.Notifier.LastError = ""

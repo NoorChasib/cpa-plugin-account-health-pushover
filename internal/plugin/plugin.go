@@ -29,7 +29,7 @@ const (
 	actionRequestHeaderValue = "1"
 )
 
-var Version = "0.3.2"
+var Version = "0.4.0"
 
 type Host = monitor.Host
 
@@ -447,6 +447,12 @@ func configFields() []protocol.ConfigField {
 		field("pushover-http-timeout", "string", "Timeout for each Pushover HTTP request (default 10s)."),
 		field("max-concurrent-checks", "integer", "Maximum concurrent host runtime reads (default 4)."),
 		field("display-timezone", "string", "IANA time zone for timestamps on the status page and in Pushover messages, e.g. America/Los_Angeles, or \"local\" for the host zone (default UTC). Presentation only."),
+		field("quota-alerts", "boolean", "Poll each account's provider usage endpoint for the regular weekly window and send one warning near the limit plus one message when it is exhausted (default false). Requires host.auth.get and host.http.do."),
+		field("quota-poll-interval", "string", "How often weekly usage is read per account while quota-alerts is enabled; minimum 1m (default 15m)."),
+		field("quota-warning-percent", "number", "Used-percentage that triggers the single per-window warning; 95 means 5% remaining (default 95)."),
+		field("quota-exhausted-percent", "number", "Used-percentage that counts as the weekly limit being reached (default 100)."),
+		field("quota-notification-priority", "integer", "Pushover priority for weekly quota messages, -2 through 1 (default 0)."),
+		field("quota-http-timeout", "string", "Timeout for each provider usage request (default 15s)."),
 	}
 }
 
