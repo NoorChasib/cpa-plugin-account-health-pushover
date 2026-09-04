@@ -176,11 +176,11 @@ For Linux AMD64 (`--ignore-missing` lets the single downloaded archive verify ag
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
-unzip account-health-pushover_0.3.1_linux_amd64.zip
+unzip account-health-pushover_0.3.2_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
 ```
 
-For ARM64, use `account-health-pushover_0.3.1_linux_arm64.zip`.
+For ARM64, use `account-health-pushover_0.3.2_linux_arm64.zip`.
 
 Update by copying a verified newer library to the same path and restarting. Uninstall by removing the library, restarting, and disabling/removing the plugin config.

@@ -115,7 +115,7 @@ Full deployment instructions: [docs/install-docker-compose.md](docs/install-dock
 2. Restart/reload CPA after changing configuration.
 3. Open Management Center → Plugin Store and refresh.
 4. Install **Account Health Pushover** (`account-health-pushover`).
-5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.3.1.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
+5. Verify the installed library with `docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins`. Plugin Store installs write a versioned library under the platform subdirectory, for example `/CLIProxyAPI/plugins/linux/amd64/account-health-pushover-v0.3.2.so`; CPA searches `<plugins-dir>/<goos>/<goarch>` before the plugins root.
 6. Add the two Coolify secret variables and enable the plugin config.
 7. Restart/reload CPA.
 8. Open **Account Health Pushover** from the Management Center sidebar. When the console is served from the CPA origin with the management key remembered, the page upgrades itself to the authenticated view with **Test notification** and **Check now** buttons; otherwise use the authenticated Management API.
@@ -134,7 +134,7 @@ Download the matching release archive plus `checksums.txt`, then verify and inst
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
-unzip account-health-pushover_0.3.1_linux_amd64.zip
+unzip account-health-pushover_0.3.2_linux_amd64.zip
 docker cp account-health-pushover.so cli-proxy-api:/CLIProxyAPI/plugins/account-health-pushover.so
 docker restart cli-proxy-api
 docker exec cli-proxy-api ls -lahR /CLIProxyAPI/plugins
@@ -264,7 +264,7 @@ make vet
 make test-race
 make build
 make c-shared
-make package-current VERSION=0.3.1
+make package-current VERSION=0.3.2
 make checksums
 make verify-release
 ```
@@ -283,14 +283,14 @@ The smoke build enables a compile-time-only local/mock endpoint seam. Release bu
 
 ## Release assets
 
-A `v0.3.1` tag produces:
+A `v0.3.2` tag produces:
 
 ```text
-account-health-pushover_0.3.1_linux_amd64.zip
-account-health-pushover_0.3.1_linux_arm64.zip
-account-health-pushover_0.3.1_darwin_amd64.zip
-account-health-pushover_0.3.1_darwin_arm64.zip
-account-health-pushover_0.3.1_windows_amd64.zip
+account-health-pushover_0.3.2_linux_amd64.zip
+account-health-pushover_0.3.2_linux_arm64.zip
+account-health-pushover_0.3.2_darwin_amd64.zip
+account-health-pushover_0.3.2_darwin_arm64.zip
+account-health-pushover_0.3.2_windows_amd64.zip
 checksums.txt
 ```
 
