@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Rehearsal version for archive names (stable X.Y.Z). Rehearsals never publish; the publish job only runs for tag pushes."
+        description: "Rehearsal version for archive names (stable X.Y.Z) when dispatched against a branch. Ignored when dispatched against a vX.Y.Z tag, which builds from the tag and publishes."
         required: false
         default: "0.3.2"
 
@@ -149,7 +149,10 @@ jobs:
         run: ./scripts/verify-release.sh dist
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Publishes for a v* tag whether the workflow started from the tag push
+    # or was dispatched manually against the tag ref (gh workflow run
+    # release.yml -r vX.Y.Z). Dispatches against a branch never publish.
+    if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     needs: [build, verify-bundle]
     runs-on: ubuntu-latest
     timeout-minutes: 15

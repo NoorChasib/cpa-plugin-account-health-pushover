@@ -52,7 +52,13 @@ Release builds do not set the test seam and always use Pushover HTTPS.
    git push origin v0.3.2
    ```
 
-5. The tag-triggered workflow runs format, vet, race tests, normal build, the enforced Docker smoke test, and a native c-shared matrix.
+5. The tag-triggered workflow runs format, vet, race tests, normal build, the enforced Docker smoke test, and a native c-shared matrix. If GitHub does not start a run for the tag push (check `gh run list --workflow=release.yml`), dispatch the same workflow against the tag ref; it builds from the tag and the `publish` job runs exactly as for a tag push:
+
+   ```bash
+   gh workflow run release.yml -r v0.3.2
+   ```
+
+   Dispatches against a branch remain rehearsals and never publish.
 6. The workflow publishes:
 
    ```text
